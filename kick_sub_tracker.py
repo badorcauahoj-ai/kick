@@ -652,6 +652,14 @@ document.getElementById('spinBtn').addEventListener('click', () => {
             abort(404)
         return send_file(OUT_CSV, as_attachment=True)
 
+    @app.route(f"/{RAW_LOG}")
+    def raw_log_file():
+        # pro diagnostiku na serveru (Railway), kde k souborům nemáš
+        # přístup jinak než přes tenhle endpoint
+        if not os.path.exists(RAW_LOG):
+            abort(404)
+        return send_file(RAW_LOG, as_attachment=True)
+
     port = int(os.environ.get("PORT", 8080))
     thread = threading.Thread(
         target=lambda: app.run(host="0.0.0.0", port=port, use_reloader=False),
