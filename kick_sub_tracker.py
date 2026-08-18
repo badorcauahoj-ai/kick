@@ -290,7 +290,7 @@ def start_file_server():
   .reveal {{ animation: fadeIn .45s cubic-bezier(.16,1,.3,1) both; }}
 
   header {{
-    display: flex; align-items: center; justify-content: space-between;
+    display: flex; align-items: center;
     margin-bottom: 28px;
   }}
   .identity {{ display: flex; align-items: center; gap: 12px; }}
@@ -305,13 +305,6 @@ def start_file_server():
   .identity .path {{
     font-family: 'Geist Mono', monospace; font-size: 12px; color: var(--text-muted); margin-top: 2px;
   }}
-  .status {{
-    display: flex; align-items: center; gap: 6px;
-    font-size: 12px; color: var(--text-secondary);
-    border: 1px solid var(--border); border-radius: 20px;
-    padding: 5px 11px 5px 9px;
-  }}
-  .status .dot {{ width: 6px; height: 6px; border-radius: 50%; background: var(--green); }}
 
   .panel {{
     background: var(--panel); border: 1px solid var(--border);
@@ -383,7 +376,6 @@ def start_file_server():
         <div class="path">{slug}</div>
       </div>
     </div>
-    <div class="status"><span class="dot"></span>Active</div>
   </header>
 
   <div class="panel">
