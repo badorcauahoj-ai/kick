@@ -1,1 +1,1 @@
-worker: python kick_sub_tracker.py
+web: python kick_sub_tracker.py
