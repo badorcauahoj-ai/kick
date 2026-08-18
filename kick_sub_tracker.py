@@ -92,9 +92,17 @@ def write_subscriber(username: str, sub_type: str, months=None, gifted_by=None):
                 months or "",
                 gifted_by or "",
             ])
-        # samostatný soubor jen se jmény - jedno jméno na řádek
+        # samostatný soubor jen se jmény - u gifterů se jméno zapíše tolikrát,
+        # kolik subů daroval (např. gift 5 subů = 5x jméno), ať má na kole
+        # štěstí odpovídající váhu. U obyčejného subu jen jednou.
+        try:
+            repeat = int(months) if sub_type == "gifter" and months else 1
+        except (TypeError, ValueError):
+            repeat = 1
+        repeat = max(1, repeat)
         with open(NAMES_FILE, "a", encoding="utf-8") as f:
-            f.write(username + "\n")
+            for _ in range(repeat):
+                f.write(username + "\n")
         extra = f" (gift od {gifted_by})" if gifted_by else ""
         print(f"[+] #{sub_count} {sub_type}: {username}{extra}")
 
@@ -290,7 +298,7 @@ def start_file_server():
   .reveal {{ animation: fadeIn .45s cubic-bezier(.16,1,.3,1) both; }}
 
   header {{
-    display: flex; align-items: center;
+    display: flex; align-items: center; justify-content: space-between;
     margin-bottom: 28px;
   }}
   .identity {{ display: flex; align-items: center; gap: 12px; }}
@@ -337,6 +345,13 @@ def start_file_server():
   .btn.secondary {{ border: 1px solid var(--border); color: var(--text); }}
   .btn.secondary:hover {{ border-color: rgba(255,255,255,0.2); }}
 
+  .nav-link {{
+    font-size: 12.5px; color: var(--text-secondary); text-decoration: none;
+    border: 1px solid var(--border); border-radius: 8px; padding: 7px 13px;
+    transition: border-color .15s ease, color .15s ease;
+  }}
+  .nav-link:hover {{ border-color: rgba(255,255,255,0.2); color: var(--text); }}
+
   .table-head {{
     display: flex; padding: 10px 20px; border-bottom: 1px solid var(--border-soft);
     font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-muted);
@@ -376,6 +391,7 @@ def start_file_server():
         <div class="path">{slug}</div>
       </div>
     </div>
+    <a class="nav-link" href="/wheel">Kolo štěstí →</a>
   </header>
 
   <div class="panel">
@@ -436,6 +452,192 @@ def start_file_server():
             names_file=NAMES_FILE,
             csv_file=OUT_CSV,
             rows=rows_html,
+        )
+
+    WHEEL_PAGE = """<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kolo štěstí — {slug}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {{
+    --bg: #050505; --panel: #0a0a0a; --border: rgba(255,255,255,0.09);
+    --text: #ededed; --text-secondary: #a0a0a0; --text-muted: #616161;
+    --white: #fafafa; --accent: #45b36b;
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: 'Geist', -apple-system, sans-serif;
+    padding: 56px 20px; display: flex; flex-direction: column; align-items: center;
+    -webkit-font-smoothing: antialiased;
+  }}
+  header {{ width: 100%; max-width: 520px; display: flex; align-items: center;
+    justify-content: space-between; margin-bottom: 32px; }}
+  header h1 {{ font-size: 15px; font-weight: 600; margin: 0; }}
+  header .path {{ font-family: 'Geist Mono', monospace; font-size: 12px; color: var(--text-muted); }}
+  .nav-link {{
+    font-size: 12.5px; color: var(--text-secondary); text-decoration: none;
+    border: 1px solid var(--border); border-radius: 8px; padding: 7px 13px;
+  }}
+  .nav-link:hover {{ border-color: rgba(255,255,255,0.2); color: var(--text); }}
+
+  .wheel-wrap {{ position: relative; width: 420px; max-width: 88vw; margin-bottom: 28px; }}
+  .pointer {{
+    position: absolute; top: -4px; left: 50%; transform: translateX(-50%);
+    width: 0; height: 0; z-index: 5;
+    border-left: 12px solid transparent; border-right: 12px solid transparent;
+    border-top: 20px solid var(--white);
+    filter: drop-shadow(0 2px 4px rgba(0,0,0,.4));
+  }}
+  canvas {{
+    width: 100%; height: auto; border-radius: 50%;
+    border: 1px solid var(--border);
+    transition: transform 4.5s cubic-bezier(.17,.67,.12,.99);
+  }}
+  .hub {{
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+    width: 14px; height: 14px; border-radius: 50%; background: var(--white); z-index: 4;
+  }}
+
+  .spin-btn {{
+    font-family: 'Geist', sans-serif; font-size: 14px; font-weight: 600;
+    background: var(--white); color: #0a0a0a; border: none; border-radius: 9px;
+    padding: 12px 26px; cursor: pointer; transition: background .15s ease;
+  }}
+  .spin-btn:hover {{ background: #d4d4d4; }}
+  .spin-btn:disabled {{ opacity: .5; cursor: not-allowed; }}
+
+  .meta {{ margin-top: 14px; font-size: 12.5px; color: var(--text-muted);
+    font-family: 'Geist Mono', monospace; text-align: center; }}
+
+  .result {{
+    display: none; margin-top: 26px; text-align: center;
+    border: 1px solid var(--border); background: var(--panel);
+    border-radius: 12px; padding: 20px 32px;
+  }}
+  .result .label {{ font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--text-muted); margin-bottom: 8px; }}
+  .result .winner {{ font-family: 'Geist Mono', monospace; font-size: 22px; font-weight: 600;
+    color: var(--accent); }}
+
+  .empty {{ color: var(--text-muted); font-size: 13.5px; text-align: center; max-width: 320px; }}
+</style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Kolo štěstí</h1>
+      <div class="path">{slug}</div>
+    </div>
+    <a class="nav-link" href="/">← Zpět na přehled</a>
+  </header>
+
+  {content}
+
+</body>
+<script>
+{script}
+</script>
+</html>"""
+
+    @app.route("/wheel")
+    def wheel():
+        names_list = []
+        if os.path.exists(NAMES_FILE):
+            with open(NAMES_FILE, encoding="utf-8") as f:
+                names_list = [line.strip() for line in f if line.strip()]
+        names_list = names_list[-300:]  # limit kvůli výkonu při hodně jménech
+
+        if not names_list:
+            content = '<div class="empty">Zatím žádná jména k roztočení — jakmile přijde první sub nebo gift, kolo se naplní automaticky.</div>'
+            script = ""
+        else:
+            content = """
+  <div class="wheel-wrap">
+    <div class="pointer"></div>
+    <canvas id="wheel" width="600" height="600"></canvas>
+    <div class="hub"></div>
+  </div>
+  <button class="spin-btn" id="spinBtn">Roztočit kolo</button>
+  <div class="meta" id="meta"></div>
+  <div class="result" id="result">
+    <div class="label">Vítěz</div>
+    <div class="winner" id="winner"></div>
+  </div>
+"""
+            names_json = json.dumps(names_list, ensure_ascii=False)
+            script = """
+const names = """ + names_json + """;
+const canvas = document.getElementById('wheel');
+const ctx = canvas.getContext('2d');
+const size = canvas.width;
+const center = size / 2;
+const radius = size / 2 - 4;
+let rotationOffset = 0;
+
+document.getElementById('meta').textContent = names.length + ' lístků na kole (váha podle počtu giftnutých subů)';
+
+function draw() {
+  ctx.clearRect(0, 0, size, size);
+  const n = names.length;
+  const arc = (2 * Math.PI) / n;
+  for (let i = 0; i < n; i++) {
+    const start = i * arc;
+    const end = start + arc;
+    ctx.beginPath();
+    ctx.moveTo(center, center);
+    ctx.arc(center, center, radius, start, end);
+    ctx.closePath();
+    ctx.fillStyle = i % 2 === 0 ? '#17171a' : '#0c0c0e';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+    ctx.stroke();
+    if (n <= 40) {
+      ctx.save();
+      ctx.translate(center, center);
+      ctx.rotate(start + arc / 2);
+      ctx.textAlign = 'right';
+      ctx.fillStyle = '#ededed';
+      ctx.font = '13px "Geist Mono", monospace';
+      ctx.fillText(names[i], radius - 12, 4);
+      ctx.restore();
+    }
+  }
+}
+draw();
+
+document.getElementById('spinBtn').addEventListener('click', () => {
+  const btn = document.getElementById('spinBtn');
+  btn.disabled = true;
+  document.getElementById('result').style.display = 'none';
+
+  const n = names.length;
+  const winnerIndex = Math.floor(Math.random() * n);
+  const arcDeg = 360 / n;
+  const targetWithinArc = winnerIndex * arcDeg + arcDeg / 2;
+  const spins = 6;
+  const finalDeg = spins * 360 + (360 - targetWithinArc);
+
+  rotationOffset += finalDeg;
+  canvas.style.transform = `rotate(${rotationOffset}deg)`;
+
+  setTimeout(() => {
+    document.getElementById('winner').textContent = names[winnerIndex];
+    document.getElementById('result').style.display = 'block';
+    btn.disabled = false;
+  }, 4600);
+});
+"""
+
+        return WHEEL_PAGE.format(
+            slug=os.environ.get("KICK_CHANNEL", "?"),
+            content=content,
+            script=script,
         )
 
     @app.route(f"/{NAMES_FILE}")
