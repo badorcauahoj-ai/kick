@@ -69,6 +69,8 @@ def ensure_csv_header():
         with open(OUT_CSV, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["timestamp", "username", "type", "months", "gifted_by"])
+    if not os.path.exists(NAMES_FILE):
+        open(NAMES_FILE, "w", encoding="utf-8").close()
 
 
 already_written = set()  # jména, co už byla jednou zapsaná - napodruhé se přeskočí
@@ -252,156 +254,167 @@ def start_file_server():
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="15">
-<title>{slug} — sub tracker</title>
+<title>{slug} — kick-sub-tracker</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=JetBrains+Mono:wght@600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
   :root {{
-    --bg: #0c0a08;
-    --panel: #141210;
-    --panel-alt: #110f0d;
-    --border: rgba(255,255,255,0.08);
-    --text: #e9e4d8;
-    --text-dim: #8c8478;
-    --text-faint: #4a453c;
-    --amber: #ffb454;
-    --amber-dim: rgba(255,180,84,0.10);
-    --red: #ff6b5e;
-    --yellow: #ffc857;
-    --green-dot: #6fcf7c;
+    --bg: #050505;
+    --panel: #0a0a0a;
+    --border: rgba(255,255,255,0.09);
+    --border-soft: rgba(255,255,255,0.06);
+    --text: #ededed;
+    --text-secondary: #a0a0a0;
+    --text-muted: #616161;
+    --white: #fafafa;
+    --green: #45b36b;
   }}
   * {{ box-sizing: border-box; }}
   body {{
     margin: 0;
-    background:
-      radial-gradient(ellipse 800px 400px at 50% -10%, rgba(255,180,84,0.05), transparent),
-      var(--bg);
+    background: var(--bg);
     color: var(--text);
-    font-family: 'IBM Plex Mono', monospace;
-    padding: 56px 18px;
+    font-family: 'Geist', -apple-system, sans-serif;
+    padding: 72px 20px;
     display: flex;
     justify-content: center;
     -webkit-font-smoothing: antialiased;
   }}
-  main {{ width: 100%; max-width: 680px; }}
+  main {{ width: 100%; max-width: 640px; }}
 
-  @keyframes fadeUp {{
-    from {{ opacity: 0; transform: translateY(10px); }}
+  @keyframes fadeIn {{
+    from {{ opacity: 0; transform: translateY(6px); }}
     to   {{ opacity: 1; transform: translateY(0); }}
   }}
-  .win {{ animation: fadeUp .5s cubic-bezier(.16,1,.3,1) both; }}
+  .reveal {{ animation: fadeIn .45s cubic-bezier(.16,1,.3,1) both; }}
 
-  @keyframes blink {{
-    0%, 45% {{ opacity: 1; }}
-    50%, 100% {{ opacity: 0; }}
-  }}
-  .cursor {{
-    display: inline-block; width: 7px; height: 15px;
-    background: var(--amber); margin-left: 2px;
-    animation: blink 1s steps(1) infinite;
-    vertical-align: text-bottom;
-  }}
-
-  .win {{
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    overflow: hidden;
-    box-shadow: 0 30px 80px -20px rgba(0,0,0,0.6);
-  }}
-  .titlebar {{
+  header {{
     display: flex; align-items: center; justify-content: space-between;
-    padding: 12px 16px; border-bottom: 1px solid var(--border);
-    background: var(--panel-alt);
+    margin-bottom: 28px;
   }}
-  .dots {{ display: flex; gap: 7px; }}
-  .dots span {{ width: 10px; height: 10px; border-radius: 50%; opacity: .55; }}
-  .dots .r {{ background: var(--red); }}
-  .dots .y {{ background: var(--yellow); }}
-  .dots .g {{ background: var(--green-dot); }}
-  .path {{ font-size: 12px; color: var(--text-dim); letter-spacing: .01em; }}
-  .live {{
-    font-size: 10.5px; color: var(--amber); letter-spacing: .08em;
+  .identity {{ display: flex; align-items: center; gap: 12px; }}
+  .mark {{
+    width: 32px; height: 32px; border-radius: 8px;
+    background: var(--panel); border: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: center;
+    font-family: 'Geist Mono', monospace; font-size: 12px; font-weight: 600;
+    color: var(--text-secondary);
+  }}
+  .identity h1 {{ font-size: 14px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }}
+  .identity .path {{
+    font-family: 'Geist Mono', monospace; font-size: 12px; color: var(--text-muted); margin-top: 2px;
+  }}
+  .status {{
     display: flex; align-items: center; gap: 6px;
+    font-size: 12px; color: var(--text-secondary);
+    border: 1px solid var(--border); border-radius: 20px;
+    padding: 5px 11px 5px 9px;
   }}
-  .live .pulse {{
-    width: 6px; height: 6px; border-radius: 50%; background: var(--amber);
-    box-shadow: 0 0 8px var(--amber);
+  .status .dot {{ width: 6px; height: 6px; border-radius: 50%; background: var(--green); }}
+
+  .panel {{
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; margin-bottom: 16px; overflow: hidden;
   }}
 
-  .term {{ padding: 22px 22px 18px; }}
-  .line {{ font-size: 13.5px; line-height: 1.9; color: var(--text-dim); }}
-  .line .prompt {{ color: var(--amber); }}
-  .line .cmd {{ color: var(--text); }}
-
-  .stat-line {{
-    font-size: 13.5px; color: var(--text-faint); margin: 4px 0 22px;
+  .meta {{ display: flex; }}
+  .meta-item {{
+    flex: 1; padding: 18px 20px; border-right: 1px solid var(--border-soft);
   }}
-  .stat-line b {{
-    color: var(--text); font-size: 15px; font-weight: 600;
+  .meta-item:last-child {{ border-right: none; }}
+  .meta-item .k {{
+    font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--text-muted); margin-bottom: 8px;
   }}
-
-  .actions {{ display: flex; gap: 18px; margin-bottom: 24px; font-size: 13px; }}
-  .actions a {{
-    color: var(--amber); text-decoration: none; border-bottom: 1px solid transparent;
-    transition: border-color .15s ease;
+  .meta-item .v {{
+    font-family: 'Geist Mono', monospace; font-size: 20px; font-weight: 500;
+    color: var(--text);
   }}
-  .actions a:hover {{ border-color: var(--amber); }}
-  .actions a::before {{ content: "→ "; color: var(--text-faint); }}
+  .meta-item .v.small {{ font-size: 14px; }}
 
-  .divider {{
-    border: none; border-top: 1px dashed var(--border); margin: 0 0 16px;
+  .actions {{ display: flex; gap: 8px; margin-bottom: 16px; }}
+  .btn {{
+    flex: 1; text-align: center; font-size: 13px; font-weight: 500;
+    text-decoration: none; padding: 10px 16px; border-radius: 8px;
+    transition: background .15s ease, border-color .15s ease;
   }}
+  .btn.primary {{ background: var(--white); color: #0a0a0a; }}
+  .btn.primary:hover {{ background: #d4d4d4; }}
+  .btn.secondary {{ border: 1px solid var(--border); color: var(--text); }}
+  .btn.secondary:hover {{ border-color: rgba(255,255,255,0.2); }}
 
-  .log {{ display: flex; flex-direction: column; }}
+  .table-head {{
+    display: flex; padding: 10px 20px; border-bottom: 1px solid var(--border-soft);
+    font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-muted);
+  }}
+  .table-head .c-name {{ flex: 1; }}
+  .table-head .c-type {{ width: 120px; }}
+  .table-head .c-qty {{ width: 50px; text-align: right; }}
+
   .row {{
-    display: flex; align-items: baseline; gap: 10px;
-    padding: 7px 0; font-size: 13px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; padding: 12px 20px;
+    border-bottom: 1px solid var(--border-soft); font-size: 13.5px;
+    transition: background .1s ease;
   }}
   .row:last-child {{ border-bottom: none; }}
-  .row .chevron {{ color: var(--amber); }}
-  .row .name {{ color: var(--text); flex: 1; }}
-  .row .type {{
-    color: var(--text-faint); font-size: 11px; letter-spacing: .04em;
+  .row:hover {{ background: rgba(255,255,255,0.02); }}
+  .row .c-name {{ flex: 1; font-family: 'Geist Mono', monospace; color: var(--text); }}
+  .row .c-type {{ width: 120px; color: var(--text-secondary); font-size: 12.5px; }}
+  .row .c-qty {{
+    width: 50px; text-align: right; color: var(--text-muted);
+    font-family: 'Geist Mono', monospace; font-size: 12px;
   }}
-  .row .months {{ color: var(--text-faint); font-size: 11px; min-width: 34px; text-align: right; }}
-
-  .empty {{ color: var(--text-faint); font-size: 13px; padding: 10px 0 4px; }}
-
-  .prompt-end {{ margin-top: 14px; font-size: 13.5px; color: var(--text-dim); }}
-  .prompt-end .prompt {{ color: var(--amber); }}
+  .empty-row {{ padding: 32px 20px; text-align: center; color: var(--text-muted); font-size: 13px; }}
 
   footer {{
-    margin-top: 18px; color: var(--text-faint); font-size: 11px;
-    display: flex; justify-content: space-between; padding: 0 4px;
+    margin-top: 20px; color: var(--text-muted); font-size: 11.5px;
+    display: flex; justify-content: space-between; padding: 0 2px;
   }}
 </style>
 </head>
 <body>
-<main>
-  <div class="win">
-    <div class="titlebar">
-      <div class="dots"><span class="r"></span><span class="y"></span><span class="g"></span></div>
-      <div class="path">~/kick-sub-tracker — {slug}</div>
-      <div class="live"><span class="pulse"></span>LIVE</div>
-    </div>
-
-    <div class="term">
-      <div class="line"><span class="prompt">$</span> <span class="cmd">watching chatroom for new subs / gifts...</span></div>
-      <div class="stat-line"><b>{count}</b> jmen zaznamenáno</div>
-
-      <div class="actions">
-        <a href="/{names_file}">stáhnout jména (.txt)</a>
-        <a href="/{csv_file}">export detailu (.csv)</a>
+<main class="reveal">
+  <header>
+    <div class="identity">
+      <div class="mark">KS</div>
+      <div>
+        <h1>kick-sub-tracker</h1>
+        <div class="path">{slug}</div>
       </div>
-
-      <hr class="divider">
-
-      <div class="log">{rows}</div>
-
-      <div class="prompt-end"><span class="prompt">$</span><span class="cursor"></span></div>
     </div>
+    <div class="status"><span class="dot"></span>Active</div>
+  </header>
+
+  <div class="panel">
+    <div class="meta">
+      <div class="meta-item">
+        <div class="k">Zaznamenáno</div>
+        <div class="v">{count}</div>
+      </div>
+      <div class="meta-item">
+        <div class="k">Kanál</div>
+        <div class="v small">{slug}</div>
+      </div>
+      <div class="meta-item">
+        <div class="k">Zdroj</div>
+        <div class="v small">kick pusher</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="actions">
+    <a class="btn primary" href="/{names_file}">Stáhnout jména (.txt)</a>
+    <a class="btn secondary" href="/{csv_file}">Export detailu (.csv)</a>
+  </div>
+
+  <div class="panel">
+    <div class="table-head">
+      <div class="c-name">Jméno</div>
+      <div class="c-type">Typ</div>
+      <div class="c-qty">Počet</div>
+    </div>
+    {rows}
   </div>
 
   <footer>
@@ -414,16 +427,15 @@ def start_file_server():
 
     @app.route("/")
     def index():
-        rows_html = '<div class="empty">// čekám na první sub nebo gift...</div>'
+        rows_html = '<div class="empty-row">Žádné jméno zatím zaznamenané — čekám na první sub/gift.</div>'
         if os.path.exists(OUT_CSV):
             with open(OUT_CSV, encoding="utf-8") as f:
                 reader = list(csv.reader(f))[1:]  # bez hlavičky
             if reader:
                 rows_html = "".join(
-                    f'<div class="row"><span class="chevron">&gt;</span>'
-                    f'<span class="name">{r[1]}</span>'
-                    f'<span class="type">{r[2]}</span>'
-                    f'<span class="months">{("x" + r[3]) if r[3] else ""}</span></div>'
+                    f'<div class="row"><span class="c-name">{r[1]}</span>'
+                    f'<span class="c-type">{r[2]}</span>'
+                    f'<span class="c-qty">{r[3] or "—"}</span></div>'
                     for r in reversed(reader[-50:])  # posledních 50, nejnovější nahoře
                 )
         return PAGE.format(
