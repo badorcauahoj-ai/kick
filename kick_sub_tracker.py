@@ -250,86 +250,161 @@ def start_file_server():
 <html lang="cs">
 <head>
 <meta charset="UTF-8">
-<meta http-equiv="refresh" content="10">
-<title>Kick Sub Tracker</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="15">
+<title>{slug} — Sub Tracker</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=DM+Sans:opsz,wght@9..40,400;9..40,500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
-  :root {{ color-scheme: dark; }}
+  :root {{
+    --bg-primary: #0b0c0c;
+    --bg-card: #131515;
+    --bg-row: #101212;
+    --bg-row-alt: #0e0f0f;
+    --text-primary: #eef0ee;
+    --text-secondary: #8a938e;
+    --text-muted: #52605a;
+    --border: rgba(255,255,255,0.07);
+    --accent: #4ee08a;
+    --accent-dim: rgba(78,224,138,0.12);
+  }}
   * {{ box-sizing: border-box; }}
   body {{
-    margin: 0; padding: 40px 20px;
-    background: radial-gradient(circle at top, #0f1613 0%, #05070a 60%);
-    color: #e7f5ec;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    display: flex; justify-content: center;
+    margin: 0;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-family: 'DM Sans', sans-serif;
+    padding: 64px 20px;
+    display: flex;
+    justify-content: center;
+    -webkit-font-smoothing: antialiased;
   }}
-  .card {{
-    width: 100%; max-width: 640px;
-    background: #10171380;
-    border: 1px solid #2a3a30;
-    border-radius: 16px;
-    padding: 32px;
-    backdrop-filter: blur(6px);
+  main {{ width: 100%; max-width: 720px; }}
+
+  @keyframes fadeUp {{
+    from {{ opacity: 0; transform: translateY(14px); }}
+    to   {{ opacity: 1; transform: translateY(0); }}
   }}
-  .brand {{ display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }}
-  .brand .dot {{ width: 10px; height: 10px; border-radius: 50%; background: #53fc18;
-    box-shadow: 0 0 10px #53fc18; }}
-  h1 {{ font-size: 20px; margin: 0; color: #53fc18; letter-spacing: .3px; }}
-  .sub {{ color: #8fa398; font-size: 13px; margin: 4px 0 28px; }}
-  .count {{
-    font-size: 48px; font-weight: 700; margin: 0; line-height: 1;
+  .reveal {{ animation: fadeUp .6s cubic-bezier(.16,1,.3,1) both; }}
+  .reveal:nth-child(2) {{ animation-delay: .06s; }}
+  .reveal:nth-child(3) {{ animation-delay: .12s; }}
+
+  header {{ display: flex; align-items: baseline; justify-content: space-between;
+    margin-bottom: 40px; }}
+  .title-group h1 {{
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 22px; font-weight: 600; letter-spacing: -0.02em;
+    margin: 0 0 6px;
   }}
-  .count-label {{ color: #8fa398; font-size: 13px; margin-bottom: 28px; }}
-  .buttons {{ display: flex; gap: 12px; margin-bottom: 28px; flex-wrap: wrap; }}
+  .stream-tag {{
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px; color: var(--text-secondary);
+    display: inline-flex; align-items: center; gap: 6px;
+  }}
+  .stream-tag .dot {{
+    width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
+    box-shadow: 0 0 8px var(--accent);
+  }}
+  .live-badge {{
+    font-family: 'JetBrains Mono', monospace; font-size: 11px;
+    color: var(--accent); border: 1px solid var(--accent-dim);
+    background: var(--accent-dim); padding: 4px 10px; border-radius: 20px;
+    letter-spacing: .04em;
+  }}
+
+  .stats {{ display: grid; grid-template-columns: 1fr; gap: 1px;
+    background: var(--border); border: 1px solid var(--border);
+    border-radius: 14px; overflow: hidden; margin-bottom: 32px; }}
+  .stat {{ background: var(--bg-card); padding: 24px 26px; }}
+  .stat .num {{
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 40px; font-weight: 700; letter-spacing: -0.02em; line-height: 1;
+  }}
+  .stat .label {{ color: var(--text-secondary); font-size: 13px; margin-top: 8px; }}
+
+  .actions {{ display: flex; gap: 10px; margin-bottom: 40px; }}
   .btn {{
-    flex: 1; min-width: 160px; text-align: center;
-    background: #53fc18; color: #05130a; font-weight: 600;
-    padding: 12px 16px; border-radius: 10px; text-decoration: none;
-    font-size: 14px; transition: opacity .15s;
+    font-family: 'DM Sans', sans-serif; font-size: 13.5px; font-weight: 500;
+    text-decoration: none; padding: 11px 18px; border-radius: 9px;
+    border: 1px solid var(--border); color: var(--text-primary);
+    transition: border-color .15s ease, transform .1s ease;
   }}
-  .btn:hover {{ opacity: .85; }}
-  .btn.secondary {{ background: #1c2620; color: #e7f5ec; border: 1px solid #33463a; }}
-  h2 {{ font-size: 13px; text-transform: uppercase; letter-spacing: .08em;
-    color: #8fa398; margin: 0 0 12px; }}
-  .names {{ list-style: none; margin: 0; padding: 0; max-height: 320px; overflow-y: auto; }}
-  .names li {{
-    padding: 10px 14px; border-radius: 8px; margin-bottom: 6px;
-    background: #131c17; font-size: 14px; display: flex; justify-content: space-between;
+  .btn:hover {{ border-color: rgba(255,255,255,0.18); transform: translateY(-1px); }}
+  .btn.primary {{ background: var(--accent); color: #06140c; border-color: var(--accent); font-weight: 600; }}
+  .btn.primary:hover {{ opacity: .9; }}
+
+  .section-label {{
+    font-family: 'JetBrains Mono', monospace; font-size: 11px;
+    text-transform: uppercase; letter-spacing: .1em; color: var(--text-muted);
+    margin: 0 0 14px;
   }}
-  .names li span.type {{ color: #53fc18; font-size: 11px; text-transform: uppercase; }}
-  .empty {{ color: #5b6b62; font-size: 14px; padding: 20px 0; text-align: center; }}
-  footer {{ margin-top: 24px; color: #465147; font-size: 11px; text-align: center; }}
+
+  .list {{ border: 1px solid var(--border); border-radius: 14px; overflow: hidden; }}
+  .row {{
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 13px 20px; background: var(--bg-row); border-bottom: 1px solid var(--border);
+    font-size: 14px;
+  }}
+  .row:nth-child(even) {{ background: var(--bg-row-alt); }}
+  .row:last-child {{ border-bottom: none; }}
+  .row .name {{ font-family: 'JetBrains Mono', monospace; font-weight: 500; }}
+  .row .type {{
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--text-secondary); border: 1px solid var(--border);
+    padding: 3px 9px; border-radius: 20px;
+  }}
+  .empty {{ padding: 40px 20px; text-align: center; color: var(--text-muted); font-size: 14px; }}
+
+  footer {{ margin-top: 28px; color: var(--text-muted); font-size: 12px;
+    display: flex; justify-content: space-between; }}
 </style>
 </head>
 <body>
-  <div class="card">
-    <div class="brand"><div class="dot"></div><h1>KICK SUB TRACKER</h1></div>
-    <div class="sub">stream: {slug}</div>
-
-    <p class="count">{count}</p>
-    <div class="count-label">zaznamenaných jmen</div>
-
-    <div class="buttons">
-      <a class="btn" href="/{names_file}">Stáhnout jména (.txt)</a>
-      <a class="btn secondary" href="/{csv_file}">Stáhnout detail (.csv)</a>
+<main>
+  <header class="reveal">
+    <div class="title-group">
+      <h1>Sub Tracker</h1>
+      <div class="stream-tag"><span class="dot"></span>kick.com/{slug}</div>
     </div>
+    <span class="live-badge">● LIVE</span>
+  </header>
 
-    <h2>Poslední jména</h2>
-    <ul class="names">{rows}</ul>
-
-    <footer>auto-refresh každých 10s</footer>
+  <div class="stats reveal">
+    <div class="stat">
+      <div class="num">{count}</div>
+      <div class="label">zaznamenaných jmen (suby + gifty)</div>
+    </div>
   </div>
+
+  <div class="actions reveal">
+    <a class="btn primary" href="/{names_file}">Stáhnout jména · .txt</a>
+    <a class="btn" href="/{csv_file}">Detailní export · .csv</a>
+  </div>
+
+  <div class="reveal">
+    <p class="section-label">Poslední záznamy</p>
+    <div class="list">{rows}</div>
+  </div>
+
+  <footer>
+    <span>auto-refresh 15s</span>
+    <span>kick-sub-tracker</span>
+  </footer>
+</main>
 </body>
 </html>"""
 
     @app.route("/")
     def index():
-        rows_html = '<li class="empty">Zatím žádné zaznamenané jméno...</li>'
+        rows_html = '<div class="empty">Zatím žádné zaznamenané jméno — čekám na první sub nebo gift.</div>'
         if os.path.exists(OUT_CSV):
             with open(OUT_CSV, encoding="utf-8") as f:
                 reader = list(csv.reader(f))[1:]  # bez hlavičky
             if reader:
                 rows_html = "".join(
-                    f'<li>{r[1]}<span class="type">{r[2]}</span></li>'
+                    f'<div class="row"><span class="name">{r[1]}</span>'
+                    f'<span class="type">{r[2]}</span></div>'
                     for r in reversed(reader[-50:])  # posledních 50, nejnovější nahoře
                 )
         return PAGE.format(
