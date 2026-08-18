@@ -240,18 +240,104 @@ def on_close(ws, close_status_code, close_msg):
 
 def start_file_server():
     """
-    Jednoduchý webserver jen na stahování výsledků, když skript běží na
-    serveru (Railway) a ne na tvém PC. Lokálně na PC ho vůbec nemusíš
-    používat - soubory máš přímo ve složce.
+    Jednoduchý webserver na živý přehled a stahování výsledků, když skript
+    běží na serveru (Railway) a ne na tvém PC. Lokálně na PC ho vůbec
+    nemusíš používat - soubory máš přímo ve složce.
     """
     app = Flask(__name__)
 
+    PAGE = """<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="refresh" content="10">
+<title>Kick Sub Tracker</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0; padding: 40px 20px;
+    background: radial-gradient(circle at top, #0f1613 0%, #05070a 60%);
+    color: #e7f5ec;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    display: flex; justify-content: center;
+  }}
+  .card {{
+    width: 100%; max-width: 640px;
+    background: #10171380;
+    border: 1px solid #2a3a30;
+    border-radius: 16px;
+    padding: 32px;
+    backdrop-filter: blur(6px);
+  }}
+  .brand {{ display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }}
+  .brand .dot {{ width: 10px; height: 10px; border-radius: 50%; background: #53fc18;
+    box-shadow: 0 0 10px #53fc18; }}
+  h1 {{ font-size: 20px; margin: 0; color: #53fc18; letter-spacing: .3px; }}
+  .sub {{ color: #8fa398; font-size: 13px; margin: 4px 0 28px; }}
+  .count {{
+    font-size: 48px; font-weight: 700; margin: 0; line-height: 1;
+  }}
+  .count-label {{ color: #8fa398; font-size: 13px; margin-bottom: 28px; }}
+  .buttons {{ display: flex; gap: 12px; margin-bottom: 28px; flex-wrap: wrap; }}
+  .btn {{
+    flex: 1; min-width: 160px; text-align: center;
+    background: #53fc18; color: #05130a; font-weight: 600;
+    padding: 12px 16px; border-radius: 10px; text-decoration: none;
+    font-size: 14px; transition: opacity .15s;
+  }}
+  .btn:hover {{ opacity: .85; }}
+  .btn.secondary {{ background: #1c2620; color: #e7f5ec; border: 1px solid #33463a; }}
+  h2 {{ font-size: 13px; text-transform: uppercase; letter-spacing: .08em;
+    color: #8fa398; margin: 0 0 12px; }}
+  .names {{ list-style: none; margin: 0; padding: 0; max-height: 320px; overflow-y: auto; }}
+  .names li {{
+    padding: 10px 14px; border-radius: 8px; margin-bottom: 6px;
+    background: #131c17; font-size: 14px; display: flex; justify-content: space-between;
+  }}
+  .names li span.type {{ color: #53fc18; font-size: 11px; text-transform: uppercase; }}
+  .empty {{ color: #5b6b62; font-size: 14px; padding: 20px 0; text-align: center; }}
+  footer {{ margin-top: 24px; color: #465147; font-size: 11px; text-align: center; }}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="brand"><div class="dot"></div><h1>KICK SUB TRACKER</h1></div>
+    <div class="sub">stream: {slug}</div>
+
+    <p class="count">{count}</p>
+    <div class="count-label">zaznamenaných jmen</div>
+
+    <div class="buttons">
+      <a class="btn" href="/{names_file}">Stáhnout jména (.txt)</a>
+      <a class="btn secondary" href="/{csv_file}">Stáhnout detail (.csv)</a>
+    </div>
+
+    <h2>Poslední jména</h2>
+    <ul class="names">{rows}</ul>
+
+    <footer>auto-refresh každých 10s</footer>
+  </div>
+</body>
+</html>"""
+
     @app.route("/")
     def index():
-        return (
-            f"Kick sub tracker běží. Zaznamenáno jmen: {sub_count}<br>"
-            f'<a href="/{NAMES_FILE}">{NAMES_FILE}</a><br>'
-            f'<a href="/{OUT_CSV}">{OUT_CSV}</a>'
+        rows_html = '<li class="empty">Zatím žádné zaznamenané jméno...</li>'
+        if os.path.exists(OUT_CSV):
+            with open(OUT_CSV, encoding="utf-8") as f:
+                reader = list(csv.reader(f))[1:]  # bez hlavičky
+            if reader:
+                rows_html = "".join(
+                    f'<li>{r[1]}<span class="type">{r[2]}</span></li>'
+                    for r in reversed(reader[-50:])  # posledních 50, nejnovější nahoře
+                )
+        return PAGE.format(
+            slug=os.environ.get("KICK_CHANNEL", "?"),
+            count=sub_count,
+            names_file=NAMES_FILE,
+            csv_file=OUT_CSV,
+            rows=rows_html,
         )
 
     @app.route(f"/{NAMES_FILE}")
