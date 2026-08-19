@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 
 import requests
 import websocket  # balíček websocket-client
-from flask import Flask, send_file, abort  # jen na Railway - stažení výsledků přes web
+from flask import Flask, send_file, abort, request, jsonify  # jen na Railway - stažení výsledků přes web
 
 PUSHER_WS_URL = (
     "wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679"
@@ -105,6 +105,30 @@ def write_subscriber(username: str, sub_type: str, months=None, gifted_by=None):
                 f.write(username + "\n")
         extra = f" (gift od {gifted_by})" if gifted_by else ""
         print(f"[+] #{sub_count} {sub_type}: {username}{extra}")
+
+
+def remove_one_ticket(username: str) -> bool:
+    """
+    Odebere JEDEN výskyt jména z NAMES_FILE (kolo štěstí) - pokud tam bylo
+    5x (5 giftnutých subů), zůstane 4x. Vrací True, pokud se něco smazalo.
+    """
+    with lock:
+        if not os.path.exists(NAMES_FILE):
+            return False
+        with open(NAMES_FILE, encoding="utf-8") as f:
+            lines = [line.rstrip("\n") for line in f]
+        removed = False
+        new_lines = []
+        for line in lines:
+            if not removed and line == username:
+                removed = True  # přeskoč přesně jeden výskyt
+                continue
+            new_lines.append(line)
+        if removed:
+            with open(NAMES_FILE, "w", encoding="utf-8") as f:
+                for line in new_lines:
+                    f.write(line + "\n")
+        return removed
 
 
 def log_raw(event_name: str, data: dict):
@@ -523,7 +547,19 @@ def start_file_server():
   .result .label {{ font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
     color: var(--text-muted); margin-bottom: 8px; }}
   .result .winner {{ font-family: 'Geist Mono', monospace; font-size: 22px; font-weight: 600;
-    color: var(--accent); }}
+    color: var(--accent); margin-bottom: 18px; }}
+  .result-actions {{ display: flex; gap: 8px; }}
+  .result-btn {{
+    flex: 1; font-family: 'Geist', sans-serif; font-size: 13px; font-weight: 500;
+    padding: 9px 14px; border-radius: 8px; cursor: pointer;
+    transition: opacity .15s ease, border-color .15s ease;
+  }}
+  .result-btn:disabled {{ opacity: .5; cursor: not-allowed; }}
+  .result-btn.remove {{ background: transparent; border: 1px solid rgba(255,107,94,0.4); color: #ff6b5e; }}
+  .result-btn.remove:hover:not(:disabled) {{ border-color: #ff6b5e; }}
+  .result-btn.keep {{ background: transparent; border: 1px solid var(--border); color: var(--text); }}
+  .result-btn.keep:hover:not(:disabled) {{ border-color: rgba(255,255,255,0.2); }}
+  .remove-status {{ margin-top: 10px; font-size: 12px; color: var(--text-muted); min-height: 16px; }}
 
   .empty {{ color: var(--text-muted); font-size: 13.5px; text-align: center; max-width: 320px; }}
 </style>
@@ -568,6 +604,11 @@ def start_file_server():
   <div class="result" id="result">
     <div class="label">Vítěz</div>
     <div class="winner" id="winner"></div>
+    <div class="result-actions">
+      <button class="result-btn remove" id="removeBtn">Odebrat z kola</button>
+      <button class="result-btn keep" id="keepBtn">Nechat na kole</button>
+    </div>
+    <div class="remove-status" id="removeStatus"></div>
   </div>
 """
             names_json = json.dumps(names_list, ensure_ascii=False)
@@ -629,8 +670,45 @@ document.getElementById('spinBtn').addEventListener('click', () => {
   setTimeout(() => {
     document.getElementById('winner').textContent = names[winnerIndex];
     document.getElementById('result').style.display = 'block';
+    document.getElementById('removeBtn').disabled = false;
+    document.getElementById('keepBtn').disabled = false;
+    document.getElementById('removeStatus').textContent = '';
     btn.disabled = false;
   }, 4600);
+});
+
+document.getElementById('removeBtn').addEventListener('click', async () => {
+  const winner = document.getElementById('winner').textContent;
+  const removeBtn = document.getElementById('removeBtn');
+  const keepBtn = document.getElementById('keepBtn');
+  removeBtn.disabled = true;
+  keepBtn.disabled = true;
+  document.getElementById('removeStatus').textContent = 'Odebírám...';
+  try {
+    const resp = await fetch('/wheel/remove', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: winner }),
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      document.getElementById('removeStatus').textContent =
+        'Odebráno - zbývá ' + data.remaining + 'x na kole. Stránka se za chvíli obnoví...';
+      setTimeout(() => location.reload(), 1200);
+    } else {
+      document.getElementById('removeStatus').textContent = 'Nepovedlo se odebrat.';
+      removeBtn.disabled = false;
+      keepBtn.disabled = false;
+    }
+  } catch (e) {
+    document.getElementById('removeStatus').textContent = 'Chyba při odebírání.';
+    removeBtn.disabled = false;
+    keepBtn.disabled = false;
+  }
+});
+
+document.getElementById('keepBtn').addEventListener('click', () => {
+  document.getElementById('result').style.display = 'none';
 });
 """
 
@@ -639,6 +717,19 @@ document.getElementById('spinBtn').addEventListener('click', () => {
             content=content,
             script=script,
         )
+
+    @app.route("/wheel/remove", methods=["POST"])
+    def wheel_remove():
+        payload = request.get_json(silent=True) or {}
+        name = (payload.get("name") or "").strip()
+        if not name:
+            return jsonify(ok=False, error="chybí jméno"), 400
+        removed = remove_one_ticket(name)
+        remaining = 0
+        if os.path.exists(NAMES_FILE):
+            with open(NAMES_FILE, encoding="utf-8") as f:
+                remaining = sum(1 for line in f if line.strip() == name)
+        return jsonify(ok=removed, remaining=remaining)
 
     @app.route(f"/{NAMES_FILE}")
     def names():
