@@ -139,6 +139,44 @@ def remove_one_ticket(username: str) -> bool:
         return removed
 
 
+def remove_username_completely(username: str) -> bool:
+    """
+    Smaže jméno úplně - ze subscribers.csv (řádek v přehledu), ze
+    subscription_names.txt (VŠECHNY výskyty, ne jen jeden - jinak by
+    zůstávalo na kole štěstí) a z already_written, aby se dal ten člověk
+    znovu zapsat, kdyby si příště reálně koupil/giftnul sub znovu.
+    """
+    global sub_count
+    with lock:
+        found = False
+
+        if os.path.exists(OUT_CSV):
+            with open(OUT_CSV, encoding="utf-8") as f:
+                rows = list(csv.reader(f))
+            header, body = rows[0], rows[1:]
+            new_body = [r for r in body if r[1] != username]
+            if len(new_body) != len(body):
+                found = True
+                sub_count = max(0, sub_count - 1)
+            with open(OUT_CSV, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+                writer.writerows(new_body)
+
+        if os.path.exists(NAMES_FILE):
+            with open(NAMES_FILE, encoding="utf-8") as f:
+                lines = [line.rstrip("\n") for line in f]
+            new_lines = [line for line in lines if line != username]
+            if len(new_lines) != len(lines):
+                found = True
+            with open(NAMES_FILE, "w", encoding="utf-8") as f:
+                for line in new_lines:
+                    f.write(line + "\n")
+
+        already_written.discard(username)
+        return found
+
+
 def log_raw(event_name: str, data: dict):
     with open(RAW_LOG, "a", encoding="utf-8") as f:
         f.write(json.dumps({"event": event_name, "data": data}, ensure_ascii=False) + "\n")
@@ -405,6 +443,14 @@ def start_file_server():
     width: 50px; text-align: right; color: var(--text-muted);
     font-family: 'Geist Mono', monospace; font-size: 12px;
   }}
+  .row .c-del {{ width: 28px; text-align: right; }}
+  .del-btn {{
+    background: none; border: none; color: var(--text-muted);
+    font-size: 15px; line-height: 1; cursor: pointer; padding: 4px 6px;
+    border-radius: 6px; transition: color .15s ease, background .15s ease;
+  }}
+  .del-btn:hover {{ color: #ff6b5e; background: rgba(255,107,94,0.08); }}
+  .del-btn:disabled {{ opacity: .4; cursor: not-allowed; }}
   .empty-row {{ padding: 32px 20px; text-align: center; color: var(--text-muted); font-size: 13px; }}
 
   footer {{
@@ -453,6 +499,7 @@ def start_file_server():
       <div class="c-name">Jméno</div>
       <div class="c-type">Typ</div>
       <div class="c-qty">Počet</div>
+      <div class="c-del"></div>
     </div>
     {rows}
   </div>
@@ -462,6 +509,30 @@ def start_file_server():
     <span>kick-sub-tracker.py</span>
   </footer>
 </main>
+<script>
+document.querySelectorAll('.del-btn').forEach(btn => {{
+  btn.addEventListener('click', async () => {{
+    const name = btn.dataset.name;
+    if (!confirm('Smazat ' + name + ' úplně (i z kola štěstí)?')) return;
+    btn.disabled = true;
+    try {{
+      const resp = await fetch('/delete', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ name: name }}),
+      }});
+      const data = await resp.json();
+      if (data.ok) {{
+        btn.closest('.row').remove();
+      }} else {{
+        btn.disabled = false;
+      }}
+    }} catch (e) {{
+      btn.disabled = false;
+    }}
+  }});
+}});
+</script>
 </body>
 </html>"""
 
@@ -475,7 +546,8 @@ def start_file_server():
                 rows_html = "".join(
                     f'<div class="row"><span class="c-name">{r[1]}</span>'
                     f'<span class="c-type">{r[2]}</span>'
-                    f'<span class="c-qty">{r[3] or "—"}</span></div>'
+                    f'<span class="c-qty">{r[3] or "—"}</span>'
+                    f'<span class="c-del"><button class="del-btn" data-name="{r[1]}">×</button></span></div>'
                     for r in reversed(reader[-50:])  # posledních 50, nejnovější nahoře
                 )
         return PAGE.format(
@@ -485,6 +557,16 @@ def start_file_server():
             csv_file=os.path.basename(OUT_CSV),
             rows=rows_html,
         )
+
+    @app.route("/delete", methods=["POST"])
+    def delete_name():
+        payload = request.get_json(silent=True) or {}
+        name = (payload.get("name") or "").strip()
+        if not name:
+            return jsonify(ok=False, error="chybí jméno"), 400
+        found = remove_username_completely(name)
+        return jsonify(ok=found)
+
 
     WHEEL_PAGE = """<!DOCTYPE html>
 <html lang="cs">
