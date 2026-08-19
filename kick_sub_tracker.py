@@ -37,9 +37,17 @@ PUSHER_WS_URL = (
     "?protocol=7&client=js&version=8.4.0-rc2&flash=false"
 )
 
-OUT_CSV = "subscribers.csv"
-NAMES_FILE = "subscription_names.txt"  # jen jména odběratelů, jedno jméno na řádek
-RAW_LOG = "raw_events.jsonl"  # syrové eventy pro debug, kdyby Kick změnil formát
+# DATA_DIR: pokud v Railway přidáš Volume a namountuješ ho (např. na /data)
+# a nastavíš proměnnou prostředí DATA_DIR=/data, soubory se budou ukládat
+# tam a PŘEŽIJÍ redeploy/restart. Bez nastavené proměnné se ukládá do
+# aktuální složky jako doteď (na Railway bez Volume se to smaže při
+# každém redeploy - proto to teď přidáváme).
+DATA_DIR = os.environ.get("DATA_DIR", ".")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+OUT_CSV = os.path.join(DATA_DIR, "subscribers.csv")
+NAMES_FILE = os.path.join(DATA_DIR, "subscription_names.txt")  # jen jména odběratelů, jedno jméno na řádek
+RAW_LOG = os.path.join(DATA_DIR, "raw_events.jsonl")  # syrové eventy pro debug, kdyby Kick změnil formát
 
 sub_count = 0
 lock = threading.Lock()
@@ -473,8 +481,8 @@ def start_file_server():
         return PAGE.format(
             slug=os.environ.get("KICK_CHANNEL", "?"),
             count=sub_count,
-            names_file=NAMES_FILE,
-            csv_file=OUT_CSV,
+            names_file=os.path.basename(NAMES_FILE),
+            csv_file=os.path.basename(OUT_CSV),
             rows=rows_html,
         )
 
@@ -731,19 +739,23 @@ document.getElementById('keepBtn').addEventListener('click', () => {
                 remaining = sum(1 for line in f if line.strip() == name)
         return jsonify(ok=removed, remaining=remaining)
 
-    @app.route(f"/{NAMES_FILE}")
+    NAMES_URL = os.path.basename(NAMES_FILE)
+    CSV_URL = os.path.basename(OUT_CSV)
+    RAW_URL = os.path.basename(RAW_LOG)
+
+    @app.route(f"/{NAMES_URL}")
     def names():
         if not os.path.exists(NAMES_FILE):
             abort(404)
         return send_file(NAMES_FILE, as_attachment=True)
 
-    @app.route(f"/{OUT_CSV}")
+    @app.route(f"/{CSV_URL}")
     def csv_file():
         if not os.path.exists(OUT_CSV):
             abort(404)
         return send_file(OUT_CSV, as_attachment=True)
 
-    @app.route(f"/{RAW_LOG}")
+    @app.route(f"/{RAW_URL}")
     def raw_log_file():
         # pro diagnostiku na serveru (Railway), kde k souborům nemáš
         # přístup jinak než přes tenhle endpoint
@@ -757,7 +769,7 @@ document.getElementById('keepBtn').addEventListener('click', () => {
         daemon=True,
     )
     thread.start()
-    print(f"[i] Webserver pro stažení souborů běží na portu {port} (/, /{NAMES_FILE}, /{OUT_CSV})")
+    print(f"[i] Webserver pro stažení souborů běží na portu {port} (/, /{NAMES_URL}, /{CSV_URL})")
 
 
 def main():
