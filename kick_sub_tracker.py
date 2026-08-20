@@ -82,6 +82,8 @@ def ensure_csv_header():
 
 
 already_written = set()  # jména, co už byla jednou zapsaná - napodruhé se přeskočí
+gifter_badge_counts = {}  # username -> poslední známý počet z badge "Sub Gifter"
+id_to_username = {}  # user_id -> username, plníme z každé chat zprávy (sender.id/sender.username)
 
 
 def write_subscriber(username: str, sub_type: str, months=None, gifted_by=None):
@@ -113,6 +115,46 @@ def write_subscriber(username: str, sub_type: str, months=None, gifted_by=None):
                 f.write(username + "\n")
         extra = f" (gift od {gifted_by})" if gifted_by else ""
         print(f"[+] #{sub_count} {sub_type}: {username}{extra}")
+
+
+def record_gifter_badge(username: str, badge_count: int):
+    """
+    Sleduje badge "Sub Gifter" (count), který Kick posílá u KAŽDÉ chat
+    zprávy daného uživatele (v poli sender.identity.badges). Tenhle počet
+    Kick průběžně zvyšuje, jak člověk giftuje - takže rozdíl mezi dvěma
+    pozorováními u stejného člověka = kolik nových subů právě giftnul.
+
+    Tohle je spolehlivější než cokoliv jiného, protože chodí v BĚŽNÝCH
+    chat zprávách, které stejně dostáváme - na rozdíl od gift-specific
+    eventů/textů, které Kick na veřejném websocketu vůbec neposílá
+    (ověřeno na stovkách reálných eventů).
+
+    Funguje jen pro giftery, co v chatu alespoň jednou něco napíšou -
+    tichého giftera, co nikdy nepíše, tímhle způsobem nezachytíme.
+    """
+    global sub_count
+    with lock:
+        prev = gifter_badge_counts.get(username)
+        gifter_badge_counts[username] = badge_count
+        if prev is None:
+            return  # první pozorování - neznáme "od kdy" počítat, historii nedomýšlíme
+        delta = badge_count - prev
+        if delta <= 0:
+            return
+        sub_count += 1
+        with open(OUT_CSV, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                datetime.now(timezone.utc).isoformat(),
+                username,
+                "gifter",
+                delta,
+                "",
+            ])
+        with open(NAMES_FILE, "a", encoding="utf-8") as f:
+            for _ in range(delta):
+                f.write(username + "\n")
+        print(f"[+] #{sub_count} gifter (badge): {username} +{delta} (celkem {badge_count})")
 
 
 def remove_one_ticket(username: str) -> bool:
@@ -220,6 +262,19 @@ def extract_subscribers(event_name: str, data: dict):
         # záměrně ho přeskakujeme, aby se odběratel nezapsal dvakrát
         return
 
+    if event_name == "App\\Events\\LuckyUsersWhoGotGiftSubscriptionsEvent":
+        # EXPERIMENTÁLNÍ - podle staršího (2023) zdroje tenhle event nese
+        # user_ids konkrétních lidí, co dostali gift sub z "community gift"
+        # vlny. Jména neznáme přímo (jen číselné ID), takže je dohledáváme
+        # v id_to_username (plní se z běžných chat zpráv).
+        for user_id in data.get("user_ids", []):
+            username = id_to_username.get(user_id)
+            if username:
+                write_subscriber(username, "gift_subscription")
+            else:
+                print(f"[i] LuckyUsersWhoGotGiftSubscriptionsEvent: neznámé user_id {user_id} (zatím nenapsal do chatu)")
+        return
+
     if event_name == "App\\Events\\GiftsLeaderboardUpdated":
         # Žebříček dárců gift subů - jméno dárce + jeho celkový počet
         # darovaných subů. write_subscriber si už sama hlídá, že se stejné
@@ -238,8 +293,30 @@ def extract_subscribers(event_name: str, data: dict):
     content = (data.get("content") or "").strip()
     sender = data.get("sender", {}) or {}
     sender_username = sender.get("username")
-    if not content or not sender_username:
+    if not sender_username:
         return
+
+    # Plníme mapu user_id -> username, ať umíme dohledat jméno, kdyby
+    # přišel LuckyUsersWhoGotGiftSubscriptionsEvent (nese jen číselná ID)
+    sender_id = sender.get("id")
+    if sender_id is not None:
+        id_to_username[sender_id] = sender_username
+
+    # Sledování badge "Sub Gifter" - běží u KAŽDÉ zprávy, nezávisle na
+    # textu. Tohle je hlavní spolehlivý zdroj informací o giftech.
+    badges = sender.get("identity", {}).get("badges", [])
+    for badge in badges:
+        if badge.get("type") == "sub_gifter" and isinstance(badge.get("count"), int):
+            record_gifter_badge(sender_username, badge["count"])
+            break
+
+    if not content:
+        return
+
+    # Zbytek níž je jen doplňkový pokus o rozpoznání z TEXTU zprávy (pro
+    # případ, že by badge chyběl nebo Kick text přece jen posílal
+    # strukturovaně) - v praxi na reálných datech nikdy nesedí, ale
+    # necháváme jako neškodný fallback.
 
     # "Honzbii gifted a sub to niutn97" - zapisujeme jen dárce (Honzbii),
     # ne jméno obdarovaného
@@ -307,6 +384,19 @@ def on_open(ws, channel_id, chatroom_id):
     ws.send(json.dumps({
         "event": "pusher:subscribe",
         "data": {"channel": f"channel.{channel_id}"},
+    }))
+    # EXPERIMENTÁLNÍ: podle staršího (2023) open-source projektu Kick
+    # posílal žebříček dárců a "šťastné" obdarované na samostatném
+    # leaderboard kanálu. Nejsme si jistí, že tenhle kanál pod stejným
+    # jménem stále existuje, ale zkusit ho nic nestojí - pokud neexistuje,
+    # Pusher žádost jen tiše ignoruje.
+    ws.send(json.dumps({
+        "event": "pusher:subscribe",
+        "data": {"channel": f"leaderboards.{channel_id}"},
+    }))
+    ws.send(json.dumps({
+        "event": "pusher:subscribe",
+        "data": {"channel": f"gifts.{channel_id}"},
     }))
 
 
