@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.env
+
+# Local tracker output. On Railway these should live on the /data volume.
+subscribers.csv
+subscription_names.txt
+raw_events.jsonl
+seen_events.json
+*.csv.bak.*

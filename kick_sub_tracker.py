@@ -1,60 +1,405 @@
 #!/usr/bin/env python3
 """
-Kick.com Subscriber Tracker
-----------------------------
-Sleduje probíhající stream na Kick.com přes (neoficiální) Pusher websocket
-chatroomu a zapisuje jména nových/gift odběratelů do CSV souboru.
+Kick subscriber / gift-sub tracker.
 
-Kick nemá oficiálně zdokumentované eventy pro odběry, takže tenhle skript
-poslouchá VŠECHNY eventy v chatroom kanálu, loguje je do raw_events.jsonl
-(pro debug) a zároveň se je snaží rozpoznat a zapsat jako odběr. Pokud Kick
-změní formát zpráv, mrkni do raw_events.jsonl a uprav funkci
-extract_subscribers().
+What is improved compared with the pasted version:
+- accepts official Kick webhook events at POST /kick/webhook
+- records channel.subscription.gifts by gifter.username, not giftee usernames
+- keeps the old public Pusher listener as a fallback
+- deduplicates by event key instead of blocking the same username forever
+- gives gift-sub gifters one wheel ticket per gifted sub
+- reloads counts from CSV after restarts
 
-Instalace:
-    pip install websocket-client requests
+Install:
+    pip install -r requirements-kick-sub-tracker.txt
 
-Spuštění:
-    python kick_sub_tracker.py <channel_slug>
-    např.: python kick_sub_tracker.py xqc
+Run:
+    python kick_sub_tracker.py tyblaho69
+
+Useful env vars:
+    KICK_CHANNEL=tyblaho69
+    DATA_DIR=/data
+    PORT=8080
+    ENABLE_PUSHER=1
+    WEBHOOK_TOKEN=some-secret
+    ADMIN_TOKEN=some-other-secret
+
+Official webhook URL:
+    https://your-app.example.com/kick/webhook?token=some-secret
 """
 
+from __future__ import annotations
+
 import csv
+import hashlib
+import html
 import json
 import os
 import re
 import sys
-import time
 import threading
+import time
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
 import requests
-import websocket  # balíček websocket-client
-from flask import Flask, send_file, abort, request, jsonify  # jen na Railway - stažení výsledků přes web
+from flask import Flask, abort, jsonify, request, send_file
+
+try:
+    import websocket  # pip package: websocket-client
+except ImportError:  # Pusher fallback can be disabled or unavailable.
+    websocket = None
+
 
 PUSHER_WS_URL = (
     "wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679"
     "?protocol=7&client=js&version=8.4.0-rc2&flash=false"
 )
 
-# DATA_DIR: pokud v Railway přidáš Volume a namountuješ ho (např. na /data)
-# a nastavíš proměnnou prostředí DATA_DIR=/data, soubory se budou ukládat
-# tam a PŘEŽIJÍ redeploy/restart. Bez nastavené proměnné se ukládá do
-# aktuální složky jako doteď (na Railway bez Volume se to smaže při
-# každém redeploy - proto to teď přidáváme).
-DATA_DIR = os.environ.get("DATA_DIR", ".")
-os.makedirs(DATA_DIR, exist_ok=True)
+DATA_DIR = Path(os.environ.get("DATA_DIR", ".")).resolve()
+OUT_CSV = DATA_DIR / "subscribers.csv"
+NAMES_FILE = DATA_DIR / "subscription_names.txt"
+RAW_LOG = DATA_DIR / "raw_events.jsonl"
+SEEN_EVENTS_FILE = DATA_DIR / "seen_events.json"
 
-OUT_CSV = os.path.join(DATA_DIR, "subscribers.csv")
-NAMES_FILE = os.path.join(DATA_DIR, "subscription_names.txt")  # jen jména odběratelů, jedno jméno na řádek
-RAW_LOG = os.path.join(DATA_DIR, "raw_events.jsonl")  # syrové eventy pro debug, kdyby Kick změnil formát
+CSV_HEADER = ["timestamp", "username", "type", "quantity", "source", "event_key", "note"]
+OFFICIAL_SUB_EVENTS = {
+    "channel.subscription.new",
+    "channel.subscription.renewal",
+    "channel.subscription.gifts",
+}
 
-sub_count = 0
-lock = threading.Lock()
+ENABLE_PUSHER = os.environ.get("ENABLE_PUSHER", "1").lower() not in {"0", "false", "no"}
+COUNT_ANONYMOUS_GIFTS = os.environ.get("COUNT_ANONYMOUS_GIFTS", "0").lower() in {"1", "true", "yes"}
+DUPLICATE_WINDOW_SECONDS = int(os.environ.get("DUPLICATE_WINDOW_SECONDS", "8"))
+
+lock = threading.RLock()
+seen_event_keys: set[str] = set()
+gifter_badge_counts: dict[str, int] = {}
+leaderboard_gift_totals: dict[str, int] = {}
 
 
-def get_ids(slug: str):
-    """Zjistí channel_id a chatroom_id podle slugu kanálu (např. 'xqc')."""
+RE_GIFT_TO_USER = re.compile(r"gifted a sub(?:scription)? to\s+(\S+)", re.IGNORECASE)
+RE_GIFT_COMMUNITY = re.compile(r"gifted\s+(\d+)\s+subscriptions?\s+to\s+the\s+community", re.IGNORECASE)
+RE_NEW_SUB = re.compile(r"^(\S+)\s+subscribed(?:\s+for\s+(\d+)\s+months?)?", re.IGNORECASE)
+RE_RESUB = re.compile(r"^(\S+)\s+resubscribed(?:\s+for\s+(\d+)\s+months?)?", re.IGNORECASE)
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def truthy_env(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).lower() in {"1", "true", "yes"}
+
+
+def stable_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def fingerprint(prefix: str, value: Any) -> str:
+    digest = hashlib.sha256(stable_json(value).encode("utf-8")).hexdigest()
+    return f"{prefix}:{digest}"
+
+
+def safe_int(value: Any, default: int = 1) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def normalize_username(username: Any) -> str | None:
+    if username is None:
+        return None
+    text = str(username).strip()
+    return text or None
+
+
+def ensure_storage() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not OUT_CSV.exists():
+        with OUT_CSV.open("w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(CSV_HEADER)
+    else:
+        migrate_csv_if_needed()
+    if not NAMES_FILE.exists():
+        NAMES_FILE.touch()
+    load_seen_events()
+
+
+def migrate_csv_if_needed() -> None:
+    with OUT_CSV.open(newline="", encoding="utf-8") as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        with OUT_CSV.open("w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(CSV_HEADER)
+        return
+    if rows[0] == CSV_HEADER:
+        return
+
+    old_header = rows[0]
+    backup = OUT_CSV.with_suffix(f".csv.bak.{int(time.time())}")
+    OUT_CSV.replace(backup)
+
+    migrated: list[list[str]] = [CSV_HEADER]
+    for raw in rows[1:]:
+        row = dict(zip(old_header, raw))
+        username = row.get("username") or (raw[1] if len(raw) > 1 else "")
+        entry_type = row.get("type") or (raw[2] if len(raw) > 2 else "subscription")
+        quantity = row.get("months") or row.get("quantity") or (raw[3] if len(raw) > 3 else "1")
+        if not quantity:
+            quantity = "1"
+        timestamp = row.get("timestamp") or (raw[0] if raw else utc_now())
+        note = row.get("gifted_by") or row.get("note") or ""
+        event_key = row.get("event_key") or fingerprint("legacy", raw)
+        migrated.append([timestamp, username, entry_type, quantity, "legacy", event_key, note])
+
+    with OUT_CSV.open("w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerows(migrated)
+    print(f"[i] Migrated old CSV format. Backup: {backup}")
+
+
+def load_seen_events() -> None:
+    with lock:
+        seen_event_keys.clear()
+        if SEEN_EVENTS_FILE.exists():
+            try:
+                data = json.loads(SEEN_EVENTS_FILE.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    seen_event_keys.update(str(item) for item in data)
+            except json.JSONDecodeError:
+                pass
+
+        for row in read_rows_unlocked():
+            key = row.get("event_key")
+            if key:
+                seen_event_keys.add(key)
+
+
+def save_seen_events_unlocked() -> None:
+    data = sorted(seen_event_keys)
+    tmp = SEEN_EVENTS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(SEEN_EVENTS_FILE)
+
+
+def read_rows_unlocked() -> list[dict[str, str]]:
+    if not OUT_CSV.exists():
+        return []
+    with OUT_CSV.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        return [dict(row) for row in reader]
+
+
+def read_rows() -> list[dict[str, str]]:
+    with lock:
+        return read_rows_unlocked()
+
+
+def parse_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def is_recent_cross_source_duplicate(username: str, entry_type: str, quantity: int, source: str) -> bool:
+    cutoff = time.time() - DUPLICATE_WINDOW_SECONDS
+    for row in reversed(read_rows_unlocked()):
+        if row.get("username") != username:
+            continue
+        if row.get("type") != entry_type:
+            continue
+        if safe_int(row.get("quantity"), 1) != quantity:
+            continue
+        if row.get("source") == source:
+            continue
+        ts = parse_timestamp(row.get("timestamp"))
+        if ts and ts.timestamp() >= cutoff:
+            return True
+    return False
+
+
+def append_wheel_tickets_unlocked(username: str, weight: int) -> None:
+    with NAMES_FILE.open("a", encoding="utf-8") as f:
+        for _ in range(max(1, weight)):
+            f.write(username + "\n")
+
+
+def record_entry(
+    username: Any,
+    entry_type: str,
+    *,
+    quantity: int = 1,
+    source: str,
+    event_key: str | None = None,
+    note: str = "",
+    weight: int | None = None,
+) -> bool:
+    username = normalize_username(username)
+    if not username:
+        return False
+
+    quantity = max(1, safe_int(quantity, 1))
+    if weight is None:
+        weight = quantity if entry_type == "gift_subscription" else 1
+    weight = max(1, safe_int(weight, 1))
+
+    if not event_key:
+        event_key = fingerprint(source, {"username": username, "type": entry_type, "quantity": quantity, "note": note})
+
+    with lock:
+        if event_key in seen_event_keys:
+            return False
+
+        if is_recent_cross_source_duplicate(username, entry_type, quantity, source):
+            seen_event_keys.add(event_key)
+            save_seen_events_unlocked()
+            print(f"[i] Skipping probable cross-source duplicate: {username} {entry_type} x{quantity}")
+            return False
+
+        seen_event_keys.add(event_key)
+        with OUT_CSV.open("a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([utc_now(), username, entry_type, quantity, source, event_key, note])
+        append_wheel_tickets_unlocked(username, weight)
+        save_seen_events_unlocked()
+
+    print(f"[+] {entry_type}: {username} x{quantity} ({source})")
+    return True
+
+
+def remove_one_ticket(username: str) -> bool:
+    username = username.strip()
+    if not username:
+        return False
+    with lock:
+        if not NAMES_FILE.exists():
+            return False
+        lines = NAMES_FILE.read_text(encoding="utf-8").splitlines()
+        removed = False
+        kept: list[str] = []
+        for line in lines:
+            if not removed and line == username:
+                removed = True
+                continue
+            kept.append(line)
+        if removed:
+            NAMES_FILE.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+        return removed
+
+
+def remove_username_completely(username: str) -> bool:
+    username = username.strip()
+    if not username:
+        return False
+
+    with lock:
+        found = False
+        rows = read_rows_unlocked()
+        kept_rows = [row for row in rows if row.get("username") != username]
+        found = len(kept_rows) != len(rows)
+
+        with OUT_CSV.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_HEADER)
+            writer.writeheader()
+            writer.writerows(kept_rows)
+
+        if NAMES_FILE.exists():
+            names = NAMES_FILE.read_text(encoding="utf-8").splitlines()
+            kept_names = [name for name in names if name != username]
+            if len(kept_names) != len(names):
+                found = True
+            NAMES_FILE.write_text("\n".join(kept_names) + ("\n" if kept_names else ""), encoding="utf-8")
+
+        return found
+
+
+def log_raw(source: str, event_name: str, data: dict[str, Any], headers: dict[str, str] | None = None) -> None:
+    entry = {
+        "timestamp": utc_now(),
+        "source": source,
+        "event": event_name,
+        "headers": headers or {},
+        "data": data,
+    }
+    with RAW_LOG.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def webhook_event_key(event_type: str, data: dict[str, Any], headers: dict[str, str]) -> str:
+    for name in (
+        "Kick-Event-Message-Id",
+        "Kick-Event-Id",
+        "Kick-Event-Subscription-Id",
+        "X-Kick-Event-Id",
+    ):
+        value = headers.get(name)
+        if value:
+            return f"webhook:{event_type}:{value}"
+    return fingerprint(f"webhook:{event_type}", data)
+
+
+def handle_official_kick_event(event_type: str, data: dict[str, Any], headers: dict[str, str]) -> bool:
+    key = webhook_event_key(event_type, data, headers)
+
+    if event_type == "channel.subscription.new":
+        subscriber = data.get("subscriber") or {}
+        duration = safe_int(data.get("duration"), 1)
+        return record_entry(
+            subscriber.get("username"),
+            "subscription",
+            quantity=1,
+            source="webhook",
+            event_key=key,
+            note=f"duration={duration}",
+            weight=1,
+        )
+
+    if event_type == "channel.subscription.renewal":
+        subscriber = data.get("subscriber") or {}
+        duration = safe_int(data.get("duration"), 1)
+        return record_entry(
+            subscriber.get("username"),
+            "resubscription",
+            quantity=1,
+            source="webhook",
+            event_key=key,
+            note=f"duration={duration}",
+            weight=1,
+        )
+
+    if event_type == "channel.subscription.gifts":
+        gifter = data.get("gifter") or {}
+        username = normalize_username(gifter.get("username"))
+        if not username:
+            if not COUNT_ANONYMOUS_GIFTS:
+                print("[i] Anonymous gift-sub webhook skipped; gifter username is hidden by Kick.")
+                return False
+            username = "anonymous_gifter"
+
+        giftees = data.get("giftees")
+        quantity = len(giftees) if isinstance(giftees, list) else safe_int(data.get("quantity"), 1)
+        return record_entry(
+            username,
+            "gift_subscription",
+            quantity=max(1, quantity),
+            source="webhook",
+            event_key=key,
+            note="official_gift",
+            weight=max(1, quantity),
+        )
+
+    return False
+
+
+def get_ids(slug: str) -> tuple[int, int]:
     url = f"https://kick.com/api/v2/channels/{slug}"
     headers = {
         "User-Agent": (
@@ -63,301 +408,188 @@ def get_ids(slug: str):
         ),
         "Accept": "application/json",
     }
-    resp = requests.get(url, headers=headers, timeout=10)
+    resp = requests.get(url, headers=headers, timeout=15)
     resp.raise_for_status()
     data = resp.json()
-    channel_id = data["id"]
-    chatroom_id = data["chatroom"]["id"]
-    print(f"[i] Kanál '{slug}' -> channel_id = {channel_id}, chatroom_id = {chatroom_id}")
+    channel_id = int(data["id"])
+    chatroom_id = int(data["chatroom"]["id"])
+    print(f"[i] Channel {slug}: channel_id={channel_id}, chatroom_id={chatroom_id}")
     return channel_id, chatroom_id
 
 
-def ensure_csv_header():
-    if not os.path.exists(OUT_CSV):
-        with open(OUT_CSV, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["timestamp", "username", "type", "months", "gifted_by"])
-    if not os.path.exists(NAMES_FILE):
-        open(NAMES_FILE, "w", encoding="utf-8").close()
+def pusher_event_key(event_name: str, data: dict[str, Any]) -> str:
+    return fingerprint(f"pusher:{event_name}", data)
 
 
-already_written = set()  # jména, co už byla jednou zapsaná - napodruhé se přeskočí
-gifter_badge_counts = {}  # username -> poslední známý počet z badge "Sub Gifter"
-id_to_username = {}  # user_id -> username, plníme z každé chat zprávy (sender.id/sender.username)
+def record_gifter_badge(username: str, badge_count: int) -> bool:
+    username = username.strip()
+    if not username:
+        return False
 
-
-def write_subscriber(username: str, sub_type: str, months=None, gifted_by=None):
-    global sub_count
-    with lock:
-        if username in already_written:
-            return  # tohle jméno už jednou zapsané bylo, přeskakujeme
-        already_written.add(username)
-        sub_count += 1
-        with open(OUT_CSV, "a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                datetime.now(timezone.utc).isoformat(),
-                username,
-                sub_type,
-                months or "",
-                gifted_by or "",
-            ])
-        # samostatný soubor jen se jmény - u gifterů se jméno zapíše tolikrát,
-        # kolik subů daroval (např. gift 5 subů = 5x jméno), ať má na kole
-        # štěstí odpovídající váhu. U obyčejného subu jen jednou.
-        try:
-            repeat = int(months) if sub_type == "gifter" and months else 1
-        except (TypeError, ValueError):
-            repeat = 1
-        repeat = max(1, repeat)
-        with open(NAMES_FILE, "a", encoding="utf-8") as f:
-            for _ in range(repeat):
-                f.write(username + "\n")
-        extra = f" (gift od {gifted_by})" if gifted_by else ""
-        print(f"[+] #{sub_count} {sub_type}: {username}{extra}")
-
-
-def record_gifter_badge(username: str, badge_count: int):
-    """
-    Sleduje badge "Sub Gifter" (count), který Kick posílá u KAŽDÉ chat
-    zprávy daného uživatele (v poli sender.identity.badges). Tenhle počet
-    Kick průběžně zvyšuje, jak člověk giftuje - takže rozdíl mezi dvěma
-    pozorováními u stejného člověka = kolik nových subů právě giftnul.
-
-    Tohle je spolehlivější než cokoliv jiného, protože chodí v BĚŽNÝCH
-    chat zprávách, které stejně dostáváme - na rozdíl od gift-specific
-    eventů/textů, které Kick na veřejném websocketu vůbec neposílá
-    (ověřeno na stovkách reálných eventů).
-
-    Funguje jen pro giftery, co v chatu alespoň jednou něco napíšou -
-    tichého giftera, co nikdy nepíše, tímhle způsobem nezachytíme.
-    """
-    global sub_count
     with lock:
         prev = gifter_badge_counts.get(username)
         gifter_badge_counts[username] = badge_count
-        if prev is None:
-            return  # první pozorování - neznáme "od kdy" počítat, historii nedomýšlíme
-        delta = badge_count - prev
-        if delta <= 0:
-            return
-        sub_count += 1
-        with open(OUT_CSV, "a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                datetime.now(timezone.utc).isoformat(),
-                username,
-                "gifter",
-                delta,
-                "",
-            ])
-        with open(NAMES_FILE, "a", encoding="utf-8") as f:
-            for _ in range(delta):
-                f.write(username + "\n")
-        print(f"[+] #{sub_count} gifter (badge): {username} +{delta} (celkem {badge_count})")
+
+    if prev is None:
+        return False
+
+    delta = badge_count - prev
+    if delta <= 0:
+        return False
+
+    return record_entry(
+        username,
+        "gift_subscription",
+        quantity=delta,
+        source="pusher_badge",
+        event_key=f"pusher_badge:{username}:{prev}->{badge_count}",
+        note=f"sub_gifter_badge_total={badge_count}",
+        weight=delta,
+    )
 
 
-def remove_one_ticket(username: str) -> bool:
-    """
-    Odebere JEDEN výskyt jména z NAMES_FILE (kolo štěstí) - pokud tam bylo
-    5x (5 giftnutých subů), zůstane 4x. Vrací True, pokud se něco smazalo.
-    """
+def record_gifts_leaderboard(username: str, total_quantity: int) -> bool:
+    username = username.strip()
+    if not username:
+        return False
+
     with lock:
-        if not os.path.exists(NAMES_FILE):
-            return False
-        with open(NAMES_FILE, encoding="utf-8") as f:
-            lines = [line.rstrip("\n") for line in f]
-        removed = False
-        new_lines = []
-        for line in lines:
-            if not removed and line == username:
-                removed = True  # přeskoč přesně jeden výskyt
-                continue
-            new_lines.append(line)
-        if removed:
-            with open(NAMES_FILE, "w", encoding="utf-8") as f:
-                for line in new_lines:
-                    f.write(line + "\n")
-        return removed
+        prev = leaderboard_gift_totals.get(username)
+        leaderboard_gift_totals[username] = total_quantity
+
+    if prev is None:
+        return False
+
+    delta = total_quantity - prev
+    if delta <= 0:
+        return False
+
+    return record_entry(
+        username,
+        "gift_subscription",
+        quantity=delta,
+        source="pusher_leaderboard",
+        event_key=f"pusher_leaderboard:{username}:{prev}->{total_quantity}",
+        note=f"leaderboard_total={total_quantity}",
+        weight=delta,
+    )
 
 
-def remove_username_completely(username: str) -> bool:
-    """
-    Smaže jméno úplně - ze subscribers.csv (řádek v přehledu), ze
-    subscription_names.txt (VŠECHNY výskyty, ne jen jeden - jinak by
-    zůstávalo na kole štěstí) a z already_written, aby se dal ten člověk
-    znovu zapsat, kdyby si příště reálně koupil/giftnul sub znovu.
-    """
-    global sub_count
-    with lock:
-        found = False
-
-        if os.path.exists(OUT_CSV):
-            with open(OUT_CSV, encoding="utf-8") as f:
-                rows = list(csv.reader(f))
-            header, body = rows[0], rows[1:]
-            new_body = [r for r in body if r[1] != username]
-            if len(new_body) != len(body):
-                found = True
-                sub_count = max(0, sub_count - 1)
-            with open(OUT_CSV, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(header)
-                writer.writerows(new_body)
-
-        if os.path.exists(NAMES_FILE):
-            with open(NAMES_FILE, encoding="utf-8") as f:
-                lines = [line.rstrip("\n") for line in f]
-            new_lines = [line for line in lines if line != username]
-            if len(new_lines) != len(lines):
-                found = True
-            with open(NAMES_FILE, "w", encoding="utf-8") as f:
-                for line in new_lines:
-                    f.write(line + "\n")
-
-        already_written.discard(username)
-        return found
-
-
-def log_raw(event_name: str, data: dict):
-    with open(RAW_LOG, "a", encoding="utf-8") as f:
-        f.write(json.dumps({"event": event_name, "data": data}, ensure_ascii=False) + "\n")
-
-
-import re
-
-# Vzory podle SKUTEČNÝCH textů systémových zpráv z Kick chatu (ověřeno na screenshotech):
-#   "Gifted 5 subscriptions to the community!"
-#   "Honzbii gifted a sub to niutn97"
-# Necháváme i obecnější vzory pro klasický (negiftovaný) sub, protože Kick
-# posílá i tenhle typ jako systémovou zprávu v chatu (ne vždy stejně formulovanou).
-RE_GIFT_TO_USER = re.compile(r"gifted a sub(?:scription)? to\s+(\S+)", re.IGNORECASE)
-RE_GIFT_COMMUNITY = re.compile(r"[Gg]ifted (\d+) subscriptions? to the community", re.IGNORECASE)
-RE_NEW_SUB = re.compile(r"^(\S+)\s+subscribed(?:\s+for\s+(\d+)\s+months?)?", re.IGNORECASE)
-RE_RESUB = re.compile(r"^(\S+)\s+resubscribed(?:\s+for\s+(\d+)\s+months?)?", re.IGNORECASE)
-
-
-def extract_subscribers(event_name: str, data: dict):
-    """
-    Kick posílá info o subech dvěma způsoby, oba potvrzené reálnými eventy:
-
-      A) Strukturované eventy (spolehlivé, používáme přednostně):
-         - App\\Events\\SubscriptionEvent -> {"username": ..., "months": ...}
-         - App\\Events\\ChannelSubscriptionEvent -> jen doplňkový/duplicitní
-           event ke stejnému subu (obsahuje username + user_ids), IGNORUJEME
-           ho, aby se stejný sub nezapsal dvakrát.
-
-      B) Gift suby (a community gify) chodí jen jako text v běžné chat
-         zprávě (App\\Events\\ChatMessageEvent) - parsujeme regexem.
-    """
+def extract_from_pusher(event_name: str, data: dict[str, Any]) -> None:
     if event_name == "App\\Events\\SubscriptionEvent":
         username = data.get("username")
-        months = data.get("months")
-        if username:
-            write_subscriber(username, "subscription", months=months)
+        months = safe_int(data.get("months"), 1)
+        record_entry(
+            username,
+            "subscription",
+            quantity=1,
+            source="pusher",
+            event_key=pusher_event_key(event_name, data),
+            note=f"months={months}",
+            weight=1,
+        )
         return
 
     if event_name == "App\\Events\\ChannelSubscriptionEvent":
-        # duplicitní event ke stejnému subu jako SubscriptionEvent výše,
-        # záměrně ho přeskakujeme, aby se odběratel nezapsal dvakrát
         return
 
     if event_name == "App\\Events\\LuckyUsersWhoGotGiftSubscriptionsEvent":
-        # EXPERIMENTÁLNÍ - podle staršího (2023) zdroje tenhle event nese
-        # user_ids konkrétních lidí, co dostali gift sub z "community gift"
-        # vlny. Jména neznáme přímo (jen číselné ID), takže je dohledáváme
-        # v id_to_username (plní se z běžných chat zpráv).
-        for user_id in data.get("user_ids", []):
-            username = id_to_username.get(user_id)
-            if username:
-                write_subscriber(username, "gift_subscription")
-            else:
-                print(f"[i] LuckyUsersWhoGotGiftSubscriptionsEvent: neznámé user_id {user_id} (zatím nenapsal do chatu)")
+        # This event contains giftees. For your wheel we intentionally do not
+        # record giftees; gift-sub tickets belong to the buyer/gifter.
         return
 
     if event_name == "App\\Events\\GiftsLeaderboardUpdated":
-        # Žebříček dárců gift subů - jméno dárce + jeho celkový počet
-        # darovaných subů. write_subscriber si už sama hlídá, že se stejné
-        # jméno nezapíše podruhé.
-        leaderboard = data.get("leaderboard", [])
-        for entry in leaderboard:
-            username = entry.get("username")
-            quantity = entry.get("quantity")
-            if username:
-                write_subscriber(username, "gifter", months=quantity)
+        for entry in data.get("leaderboard", []) or []:
+            username = normalize_username(entry.get("username"))
+            quantity = safe_int(entry.get("quantity"), 0)
+            if username and quantity > 0:
+                record_gifts_leaderboard(username, quantity)
         return
 
     if "chatmessage" not in event_name.lower():
         return
 
-    content = (data.get("content") or "").strip()
-    sender = data.get("sender", {}) or {}
-    sender_username = sender.get("username")
+    sender = data.get("sender") or {}
+    sender_username = normalize_username(sender.get("username"))
     if not sender_username:
         return
 
-    # Plníme mapu user_id -> username, ať umíme dohledat jméno, kdyby
-    # přišel LuckyUsersWhoGotGiftSubscriptionsEvent (nese jen číselná ID)
-    sender_id = sender.get("id")
-    if sender_id is not None:
-        id_to_username[sender_id] = sender_username
-
-    # Sledování badge "Sub Gifter" - běží u KAŽDÉ zprávy, nezávisle na
-    # textu. Tohle je hlavní spolehlivý zdroj informací o giftech.
-    badges = sender.get("identity", {}).get("badges", [])
+    badges = ((sender.get("identity") or {}).get("badges") or [])
     for badge in badges:
         if badge.get("type") == "sub_gifter" and isinstance(badge.get("count"), int):
             record_gifter_badge(sender_username, badge["count"])
             break
 
+    content = (data.get("content") or "").strip()
     if not content:
         return
 
-    # Zbytek níž je jen doplňkový pokus o rozpoznání z TEXTU zprávy (pro
-    # případ, že by badge chyběl nebo Kick text přece jen posílal
-    # strukturovaně) - v praxi na reálných datech nikdy nesedí, ale
-    # necháváme jako neškodný fallback.
-
-    # "Honzbii gifted a sub to niutn97" - zapisujeme jen dárce (Honzbii),
-    # ne jméno obdarovaného
     if RE_GIFT_TO_USER.search(content):
-        write_subscriber(sender_username, "gifter")
+        record_entry(
+            sender_username,
+            "gift_subscription",
+            quantity=1,
+            source="pusher_text",
+            event_key=pusher_event_key(event_name, {"sender": sender_username, "content": content, "created_at": data.get("created_at")}),
+            note="gift_text_to_user",
+            weight=1,
+        )
         return
 
-    # "Gifted 5 subscriptions to the community!" - dárce + počet
-    m = RE_GIFT_COMMUNITY.search(content)
-    if m:
-        write_subscriber(sender_username, "gifter", months=int(m.group(1)))
+    match = RE_GIFT_COMMUNITY.search(content)
+    if match:
+        quantity = safe_int(match.group(1), 1)
+        record_entry(
+            sender_username,
+            "gift_subscription",
+            quantity=quantity,
+            source="pusher_text",
+            event_key=pusher_event_key(event_name, {"sender": sender_username, "content": content, "created_at": data.get("created_at")}),
+            note="gift_text_community",
+            weight=quantity,
+        )
         return
 
-    # "username subscribed" / "username subscribed for 3 months"
-    m = RE_NEW_SUB.match(content)
-    if m:
-        write_subscriber(m.group(1), "subscription", months=m.group(2))
+    match = RE_NEW_SUB.match(content)
+    if match:
+        record_entry(
+            match.group(1),
+            "subscription",
+            quantity=1,
+            source="pusher_text",
+            event_key=pusher_event_key(event_name, {"content": content, "created_at": data.get("created_at")}),
+            note=f"months={match.group(2) or 1}",
+            weight=1,
+        )
         return
 
-    # "username resubscribed for 3 months"
-    m = RE_RESUB.match(content)
-    if m:
-        write_subscriber(m.group(1), "resubscription", months=m.group(2))
-        return
+    match = RE_RESUB.match(content)
+    if match:
+        record_entry(
+            match.group(1),
+            "resubscription",
+            quantity=1,
+            source="pusher_text",
+            event_key=pusher_event_key(event_name, {"content": content, "created_at": data.get("created_at")}),
+            note=f"months={match.group(2) or 1}",
+            weight=1,
+        )
 
 
-def on_message(ws, message):
+def on_message(ws: Any, message: str) -> None:
     try:
         outer = json.loads(message)
     except json.JSONDecodeError:
         return
 
     event_name = outer.get("event", "")
-
     if event_name == "pusher:connection_established":
         return
     if event_name == "pusher:ping":
         ws.send(json.dumps({"event": "pusher:pong", "data": {}}))
         return
     if event_name == "pusher_internal:subscription_succeeded":
-        print("[i] Přihlášeno k chatroom kanálu, poslouchám eventy...")
+        print("[i] Pusher subscription succeeded.")
         return
 
     data = outer.get("data")
@@ -369,612 +601,43 @@ def on_message(ws, message):
     if not isinstance(data, dict):
         data = {}
 
-    log_raw(event_name, data)
-
-    extract_subscribers(event_name, data)
-
-
-def on_open(ws, channel_id, chatroom_id):
-    # kanál pro běžné chat zprávy
-    ws.send(json.dumps({
-        "event": "pusher:subscribe",
-        "data": {"channel": f"chatrooms.{chatroom_id}.v2"},
-    }))
-    # kanál pro eventy na úrovni streamera - subs, gifty, followy, bany
-    ws.send(json.dumps({
-        "event": "pusher:subscribe",
-        "data": {"channel": f"channel.{channel_id}"},
-    }))
-    # EXPERIMENTÁLNÍ: podle staršího (2023) open-source projektu Kick
-    # posílal žebříček dárců a "šťastné" obdarované na samostatném
-    # leaderboard kanálu. Nejsme si jistí, že tenhle kanál pod stejným
-    # jménem stále existuje, ale zkusit ho nic nestojí - pokud neexistuje,
-    # Pusher žádost jen tiše ignoruje.
-    ws.send(json.dumps({
-        "event": "pusher:subscribe",
-        "data": {"channel": f"leaderboards.{channel_id}"},
-    }))
-    ws.send(json.dumps({
-        "event": "pusher:subscribe",
-        "data": {"channel": f"gifts.{channel_id}"},
-    }))
+    log_raw("pusher", event_name, data)
+    extract_from_pusher(event_name, data)
 
 
-def on_error(ws, error):
-    print(f"[!] WebSocket chyba: {error}")
+def on_open(ws: Any, channel_id: int, chatroom_id: int) -> None:
+    channels = [
+        f"chatrooms.{chatroom_id}.v2",
+        f"channel.{channel_id}",
+        f"leaderboards.{channel_id}",
+        f"gifts.{channel_id}",
+    ]
+    for channel in channels:
+        ws.send(json.dumps({"event": "pusher:subscribe", "data": {"channel": channel}}))
 
 
-def on_close(ws, close_status_code, close_msg):
-    print(f"[i] Spojení uzavřeno ({close_status_code}).")
+def on_error(ws: Any, error: Any) -> None:
+    print(f"[!] WebSocket error: {error}")
 
 
-def start_file_server():
-    """
-    Jednoduchý webserver na živý přehled a stahování výsledků, když skript
-    běží na serveru (Railway) a ne na tvém PC. Lokálně na PC ho vůbec
-    nemusíš používat - soubory máš přímo ve složce.
-    """
-    app = Flask(__name__)
-
-    PAGE = """<!DOCTYPE html>
-<html lang="cs">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="15">
-<title>{slug} — kick-sub-tracker</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<style>
-  :root {{
-    --bg: #050505;
-    --panel: #0a0a0a;
-    --border: rgba(255,255,255,0.09);
-    --border-soft: rgba(255,255,255,0.06);
-    --text: #ededed;
-    --text-secondary: #a0a0a0;
-    --text-muted: #616161;
-    --white: #fafafa;
-    --green: #45b36b;
-  }}
-  * {{ box-sizing: border-box; }}
-  body {{
-    margin: 0;
-    background: var(--bg);
-    color: var(--text);
-    font-family: 'Geist', -apple-system, sans-serif;
-    padding: 72px 20px;
-    display: flex;
-    justify-content: center;
-    -webkit-font-smoothing: antialiased;
-  }}
-  main {{ width: 100%; max-width: 640px; }}
-
-  @keyframes fadeIn {{
-    from {{ opacity: 0; transform: translateY(6px); }}
-    to   {{ opacity: 1; transform: translateY(0); }}
-  }}
-  .reveal {{ animation: fadeIn .45s cubic-bezier(.16,1,.3,1) both; }}
-
-  header {{
-    display: flex; align-items: center; justify-content: space-between;
-    margin-bottom: 28px;
-  }}
-  .identity {{ display: flex; align-items: center; gap: 12px; }}
-  .mark {{
-    width: 32px; height: 32px; border-radius: 8px;
-    background: var(--panel); border: 1px solid var(--border);
-    display: flex; align-items: center; justify-content: center;
-    font-family: 'Geist Mono', monospace; font-size: 12px; font-weight: 600;
-    color: var(--text-secondary);
-  }}
-  .identity h1 {{ font-size: 14px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }}
-  .identity .path {{
-    font-family: 'Geist Mono', monospace; font-size: 12px; color: var(--text-muted); margin-top: 2px;
-  }}
-
-  .panel {{
-    background: var(--panel); border: 1px solid var(--border);
-    border-radius: 12px; margin-bottom: 16px; overflow: hidden;
-  }}
-
-  .meta {{ display: flex; }}
-  .meta-item {{
-    flex: 1; padding: 18px 20px; border-right: 1px solid var(--border-soft);
-  }}
-  .meta-item:last-child {{ border-right: none; }}
-  .meta-item .k {{
-    font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
-    color: var(--text-muted); margin-bottom: 8px;
-  }}
-  .meta-item .v {{
-    font-family: 'Geist Mono', monospace; font-size: 20px; font-weight: 500;
-    color: var(--text);
-  }}
-  .meta-item .v.small {{ font-size: 14px; }}
-
-  .actions {{ display: flex; gap: 8px; margin-bottom: 16px; }}
-  .btn {{
-    flex: 1; text-align: center; font-size: 13px; font-weight: 500;
-    text-decoration: none; padding: 10px 16px; border-radius: 8px;
-    transition: background .15s ease, border-color .15s ease;
-  }}
-  .btn.primary {{ background: var(--white); color: #0a0a0a; }}
-  .btn.primary:hover {{ background: #d4d4d4; }}
-  .btn.secondary {{ border: 1px solid var(--border); color: var(--text); }}
-  .btn.secondary:hover {{ border-color: rgba(255,255,255,0.2); }}
-
-  .nav-link {{
-    font-size: 12.5px; color: var(--text-secondary); text-decoration: none;
-    border: 1px solid var(--border); border-radius: 8px; padding: 7px 13px;
-    transition: border-color .15s ease, color .15s ease;
-  }}
-  .nav-link:hover {{ border-color: rgba(255,255,255,0.2); color: var(--text); }}
-
-  .table-head {{
-    display: flex; padding: 10px 20px; border-bottom: 1px solid var(--border-soft);
-    font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-muted);
-  }}
-  .table-head .c-name {{ flex: 1; }}
-  .table-head .c-type {{ width: 120px; }}
-  .table-head .c-qty {{ width: 50px; text-align: right; }}
-
-  .row {{
-    display: flex; align-items: center; padding: 12px 20px;
-    border-bottom: 1px solid var(--border-soft); font-size: 13.5px;
-    transition: background .1s ease;
-  }}
-  .row:last-child {{ border-bottom: none; }}
-  .row:hover {{ background: rgba(255,255,255,0.02); }}
-  .row .c-name {{ flex: 1; font-family: 'Geist Mono', monospace; color: var(--text); }}
-  .row .c-type {{ width: 120px; color: var(--text-secondary); font-size: 12.5px; }}
-  .row .c-qty {{
-    width: 50px; text-align: right; color: var(--text-muted);
-    font-family: 'Geist Mono', monospace; font-size: 12px;
-  }}
-  .row .c-del {{ width: 28px; text-align: right; }}
-  .del-btn {{
-    background: none; border: none; color: var(--text-muted);
-    font-size: 15px; line-height: 1; cursor: pointer; padding: 4px 6px;
-    border-radius: 6px; transition: color .15s ease, background .15s ease;
-  }}
-  .del-btn:hover {{ color: #ff6b5e; background: rgba(255,107,94,0.08); }}
-  .del-btn:disabled {{ opacity: .4; cursor: not-allowed; }}
-  .empty-row {{ padding: 32px 20px; text-align: center; color: var(--text-muted); font-size: 13px; }}
-
-  footer {{
-    margin-top: 20px; color: var(--text-muted); font-size: 11.5px;
-    display: flex; justify-content: space-between; padding: 0 2px;
-  }}
-</style>
-</head>
-<body>
-<main class="reveal">
-  <header>
-    <div class="identity">
-      <div class="mark">KS</div>
-      <div>
-        <h1>kick-sub-tracker</h1>
-        <div class="path">{slug}</div>
-      </div>
-    </div>
-    <a class="nav-link" href="/wheel">Kolo štěstí →</a>
-  </header>
-
-  <div class="panel">
-    <div class="meta">
-      <div class="meta-item">
-        <div class="k">Zaznamenáno</div>
-        <div class="v">{count}</div>
-      </div>
-      <div class="meta-item">
-        <div class="k">Kanál</div>
-        <div class="v small">{slug}</div>
-      </div>
-      <div class="meta-item">
-        <div class="k">Zdroj</div>
-        <div class="v small">kick pusher</div>
-      </div>
-    </div>
-  </div>
-
-  <div class="actions">
-    <a class="btn primary" href="/{names_file}">Stáhnout jména (.txt)</a>
-    <a class="btn secondary" href="/{csv_file}">Export detailu (.csv)</a>
-  </div>
-
-  <div class="panel">
-    <div class="table-head">
-      <div class="c-name">Jméno</div>
-      <div class="c-type">Typ</div>
-      <div class="c-qty">Počet</div>
-      <div class="c-del"></div>
-    </div>
-    {rows}
-  </div>
-
-  <footer>
-    <span>auto-refresh 15s</span>
-    <span>kick-sub-tracker.py</span>
-  </footer>
-</main>
-<script>
-document.querySelectorAll('.del-btn').forEach(btn => {{
-  btn.addEventListener('click', async () => {{
-    const name = btn.dataset.name;
-    if (!confirm('Smazat ' + name + ' úplně (i z kola štěstí)?')) return;
-    btn.disabled = true;
-    try {{
-      const resp = await fetch('/delete', {{
-        method: 'POST',
-        headers: {{ 'Content-Type': 'application/json' }},
-        body: JSON.stringify({{ name: name }}),
-      }});
-      const data = await resp.json();
-      if (data.ok) {{
-        btn.closest('.row').remove();
-      }} else {{
-        btn.disabled = false;
-      }}
-    }} catch (e) {{
-      btn.disabled = false;
-    }}
-  }});
-}});
-</script>
-</body>
-</html>"""
-
-    @app.route("/")
-    def index():
-        rows_html = '<div class="empty-row">Žádné jméno zatím zaznamenané — čekám na první sub/gift.</div>'
-        if os.path.exists(OUT_CSV):
-            with open(OUT_CSV, encoding="utf-8") as f:
-                reader = list(csv.reader(f))[1:]  # bez hlavičky
-            if reader:
-                rows_html = "".join(
-                    f'<div class="row"><span class="c-name">{r[1]}</span>'
-                    f'<span class="c-type">{r[2]}</span>'
-                    f'<span class="c-qty">{r[3] or "—"}</span>'
-                    f'<span class="c-del"><button class="del-btn" data-name="{r[1]}">×</button></span></div>'
-                    for r in reversed(reader[-50:])  # posledních 50, nejnovější nahoře
-                )
-        return PAGE.format(
-            slug=os.environ.get("KICK_CHANNEL", "?"),
-            count=sub_count,
-            names_file=os.path.basename(NAMES_FILE),
-            csv_file=os.path.basename(OUT_CSV),
-            rows=rows_html,
-        )
-
-    @app.route("/delete", methods=["POST"])
-    def delete_name():
-        payload = request.get_json(silent=True) or {}
-        name = (payload.get("name") or "").strip()
-        if not name:
-            return jsonify(ok=False, error="chybí jméno"), 400
-        found = remove_username_completely(name)
-        return jsonify(ok=found)
+def on_close(ws: Any, close_status_code: Any, close_msg: Any) -> None:
+    print(f"[i] WebSocket closed ({close_status_code}).")
 
 
-    WHEEL_PAGE = """<!DOCTYPE html>
-<html lang="cs">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Kolo štěstí — {slug}</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<style>
-  :root {{
-    --bg: #050505; --panel: #0a0a0a; --border: rgba(255,255,255,0.09);
-    --text: #ededed; --text-secondary: #a0a0a0; --text-muted: #616161;
-    --white: #fafafa; --accent: #45b36b;
-  }}
-  * {{ box-sizing: border-box; }}
-  body {{
-    margin: 0; background: var(--bg); color: var(--text);
-    font-family: 'Geist', -apple-system, sans-serif;
-    padding: 56px 20px; display: flex; flex-direction: column; align-items: center;
-    -webkit-font-smoothing: antialiased;
-  }}
-  header {{ width: 100%; max-width: 520px; display: flex; align-items: center;
-    justify-content: space-between; margin-bottom: 32px; }}
-  header h1 {{ font-size: 15px; font-weight: 600; margin: 0; }}
-  header .path {{ font-family: 'Geist Mono', monospace; font-size: 12px; color: var(--text-muted); }}
-  .nav-link {{
-    font-size: 12.5px; color: var(--text-secondary); text-decoration: none;
-    border: 1px solid var(--border); border-radius: 8px; padding: 7px 13px;
-  }}
-  .nav-link:hover {{ border-color: rgba(255,255,255,0.2); color: var(--text); }}
+def run_pusher_loop(slug: str) -> None:
+    if websocket is None:
+        print("[!] websocket-client is not installed; Pusher fallback disabled.")
+        return
 
-  .wheel-wrap {{ position: relative; width: 420px; max-width: 88vw; margin-bottom: 28px; }}
-  .pointer {{
-    position: absolute; top: -4px; left: 50%; transform: translateX(-50%);
-    width: 0; height: 0; z-index: 5;
-    border-left: 12px solid transparent; border-right: 12px solid transparent;
-    border-top: 20px solid var(--white);
-    filter: drop-shadow(0 2px 4px rgba(0,0,0,.4));
-  }}
-  canvas {{
-    width: 100%; height: auto; border-radius: 50%;
-    border: 1px solid var(--border);
-    transition: transform 4.5s cubic-bezier(.17,.67,.12,.99);
-  }}
-  .hub {{
-    position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
-    width: 14px; height: 14px; border-radius: 50%; background: var(--white); z-index: 4;
-  }}
-
-  .spin-btn {{
-    font-family: 'Geist', sans-serif; font-size: 14px; font-weight: 600;
-    background: var(--white); color: #0a0a0a; border: none; border-radius: 9px;
-    padding: 12px 26px; cursor: pointer; transition: background .15s ease;
-  }}
-  .spin-btn:hover {{ background: #d4d4d4; }}
-  .spin-btn:disabled {{ opacity: .5; cursor: not-allowed; }}
-
-  .meta {{ margin-top: 14px; font-size: 12.5px; color: var(--text-muted);
-    font-family: 'Geist Mono', monospace; text-align: center; }}
-
-  .result {{
-    display: none; margin-top: 26px; text-align: center;
-    border: 1px solid var(--border); background: var(--panel);
-    border-radius: 12px; padding: 20px 32px;
-  }}
-  .result .label {{ font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
-    color: var(--text-muted); margin-bottom: 8px; }}
-  .result .winner {{ font-family: 'Geist Mono', monospace; font-size: 22px; font-weight: 600;
-    color: var(--accent); margin-bottom: 18px; }}
-  .result-actions {{ display: flex; gap: 8px; }}
-  .result-btn {{
-    flex: 1; font-family: 'Geist', sans-serif; font-size: 13px; font-weight: 500;
-    padding: 9px 14px; border-radius: 8px; cursor: pointer;
-    transition: opacity .15s ease, border-color .15s ease;
-  }}
-  .result-btn:disabled {{ opacity: .5; cursor: not-allowed; }}
-  .result-btn.remove {{ background: transparent; border: 1px solid rgba(255,107,94,0.4); color: #ff6b5e; }}
-  .result-btn.remove:hover:not(:disabled) {{ border-color: #ff6b5e; }}
-  .result-btn.keep {{ background: transparent; border: 1px solid var(--border); color: var(--text); }}
-  .result-btn.keep:hover:not(:disabled) {{ border-color: rgba(255,255,255,0.2); }}
-  .remove-status {{ margin-top: 10px; font-size: 12px; color: var(--text-muted); min-height: 16px; }}
-
-  .empty {{ color: var(--text-muted); font-size: 13.5px; text-align: center; max-width: 320px; }}
-</style>
-</head>
-<body>
-  <header>
-    <div>
-      <h1>Kolo štěstí</h1>
-      <div class="path">{slug}</div>
-    </div>
-    <a class="nav-link" href="/">← Zpět na přehled</a>
-  </header>
-
-  {content}
-
-</body>
-<script>
-{script}
-</script>
-</html>"""
-
-    @app.route("/wheel")
-    def wheel():
-        names_list = []
-        if os.path.exists(NAMES_FILE):
-            with open(NAMES_FILE, encoding="utf-8") as f:
-                names_list = [line.strip() for line in f if line.strip()]
-        names_list = names_list[-300:]  # limit kvůli výkonu při hodně jménech
-
-        if not names_list:
-            content = '<div class="empty">Zatím žádná jména k roztočení — jakmile přijde první sub nebo gift, kolo se naplní automaticky.</div>'
-            script = ""
-        else:
-            content = """
-  <div class="wheel-wrap">
-    <div class="pointer"></div>
-    <canvas id="wheel" width="600" height="600"></canvas>
-    <div class="hub"></div>
-  </div>
-  <button class="spin-btn" id="spinBtn">Roztočit kolo</button>
-  <div class="meta" id="meta"></div>
-  <div class="result" id="result">
-    <div class="label">Vítěz</div>
-    <div class="winner" id="winner"></div>
-    <div class="result-actions">
-      <button class="result-btn remove" id="removeBtn">Odebrat z kola</button>
-      <button class="result-btn keep" id="keepBtn">Nechat na kole</button>
-    </div>
-    <div class="remove-status" id="removeStatus"></div>
-  </div>
-"""
-            names_json = json.dumps(names_list, ensure_ascii=False)
-            script = """
-const names = """ + names_json + """;
-const canvas = document.getElementById('wheel');
-const ctx = canvas.getContext('2d');
-const size = canvas.width;
-const center = size / 2;
-const radius = size / 2 - 4;
-let rotationOffset = 0;
-
-document.getElementById('meta').textContent = names.length + ' lístků na kole (váha podle počtu giftnutých subů)';
-
-function draw() {
-  ctx.clearRect(0, 0, size, size);
-  const n = names.length;
-  const arc = (2 * Math.PI) / n;
-  for (let i = 0; i < n; i++) {
-    const start = i * arc;
-    const end = start + arc;
-    ctx.beginPath();
-    ctx.moveTo(center, center);
-    ctx.arc(center, center, radius, start, end);
-    ctx.closePath();
-    ctx.fillStyle = i % 2 === 0 ? '#17171a' : '#0c0c0e';
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(255,255,255,0.06)';
-    ctx.stroke();
-    if (n <= 40) {
-      ctx.save();
-      ctx.translate(center, center);
-      ctx.rotate(start + arc / 2);
-      ctx.textAlign = 'right';
-      ctx.fillStyle = '#ededed';
-      ctx.font = '13px "Geist Mono", monospace';
-      ctx.fillText(names[i], radius - 12, 4);
-      ctx.restore();
-    }
-  }
-}
-draw();
-
-document.getElementById('spinBtn').addEventListener('click', () => {
-  const btn = document.getElementById('spinBtn');
-  btn.disabled = true;
-  document.getElementById('result').style.display = 'none';
-
-  const n = names.length;
-  const winnerIndex = Math.floor(Math.random() * n);
-  const arcDeg = 360 / n;
-  const targetWithinArc = winnerIndex * arcDeg + arcDeg / 2;
-  const spins = 6;
-  const finalDeg = spins * 360 + (360 - targetWithinArc);
-
-  rotationOffset += finalDeg;
-  canvas.style.transform = `rotate(${rotationOffset}deg)`;
-
-  setTimeout(() => {
-    document.getElementById('winner').textContent = names[winnerIndex];
-    document.getElementById('result').style.display = 'block';
-    document.getElementById('removeBtn').disabled = false;
-    document.getElementById('keepBtn').disabled = false;
-    document.getElementById('removeStatus').textContent = '';
-    btn.disabled = false;
-  }, 4600);
-});
-
-document.getElementById('removeBtn').addEventListener('click', async () => {
-  const winner = document.getElementById('winner').textContent;
-  const removeBtn = document.getElementById('removeBtn');
-  const keepBtn = document.getElementById('keepBtn');
-  removeBtn.disabled = true;
-  keepBtn.disabled = true;
-  document.getElementById('removeStatus').textContent = 'Odebírám...';
-  try {
-    const resp = await fetch('/wheel/remove', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: winner }),
-    });
-    const data = await resp.json();
-    if (data.ok) {
-      document.getElementById('removeStatus').textContent =
-        'Odebráno - zbývá ' + data.remaining + 'x na kole. Stránka se za chvíli obnoví...';
-      setTimeout(() => location.reload(), 1200);
-    } else {
-      document.getElementById('removeStatus').textContent = 'Nepovedlo se odebrat.';
-      removeBtn.disabled = false;
-      keepBtn.disabled = false;
-    }
-  } catch (e) {
-    document.getElementById('removeStatus').textContent = 'Chyba při odebírání.';
-    removeBtn.disabled = false;
-    keepBtn.disabled = false;
-  }
-});
-
-document.getElementById('keepBtn').addEventListener('click', () => {
-  document.getElementById('result').style.display = 'none';
-});
-"""
-
-        return WHEEL_PAGE.format(
-            slug=os.environ.get("KICK_CHANNEL", "?"),
-            content=content,
-            script=script,
-        )
-
-    @app.route("/wheel/remove", methods=["POST"])
-    def wheel_remove():
-        payload = request.get_json(silent=True) or {}
-        name = (payload.get("name") or "").strip()
-        if not name:
-            return jsonify(ok=False, error="chybí jméno"), 400
-        removed = remove_one_ticket(name)
-        remaining = 0
-        if os.path.exists(NAMES_FILE):
-            with open(NAMES_FILE, encoding="utf-8") as f:
-                remaining = sum(1 for line in f if line.strip() == name)
-        return jsonify(ok=removed, remaining=remaining)
-
-    NAMES_URL = os.path.basename(NAMES_FILE)
-    CSV_URL = os.path.basename(OUT_CSV)
-    RAW_URL = os.path.basename(RAW_LOG)
-
-    @app.route(f"/{NAMES_URL}")
-    def names():
-        if not os.path.exists(NAMES_FILE):
-            abort(404)
-        return send_file(NAMES_FILE, as_attachment=True)
-
-    @app.route(f"/{CSV_URL}")
-    def csv_file():
-        if not os.path.exists(OUT_CSV):
-            abort(404)
-        return send_file(OUT_CSV, as_attachment=True)
-
-    @app.route(f"/{RAW_URL}")
-    def raw_log_file():
-        # pro diagnostiku na serveru (Railway), kde k souborům nemáš
-        # přístup jinak než přes tenhle endpoint
-        if not os.path.exists(RAW_LOG):
-            abort(404)
-        return send_file(RAW_LOG, as_attachment=True)
-
-    port = int(os.environ.get("PORT", 8080))
-    thread = threading.Thread(
-        target=lambda: app.run(host="0.0.0.0", port=port, use_reloader=False),
-        daemon=True,
-    )
-    thread.start()
-    print(f"[i] Webserver pro stažení souborů běží na portu {port} (/, /{NAMES_URL}, /{CSV_URL})")
-
-
-def main():
-    slug = os.environ.get("KICK_CHANNEL") or (sys.argv[1] if len(sys.argv) > 1 else None)
-    if not slug:
-        print("Nastav proměnnou prostředí KICK_CHANNEL, nebo spusť: python kick_sub_tracker.py <channel_slug>")
-        sys.exit(1)
-
-    ensure_csv_header()
-    start_file_server()  # v Railway/na serveru odsud stahuješ subscribers.csv a subscription_names.txt
-
-    try:
-        channel_id, chatroom_id = get_ids(slug)
-    except Exception as e:
-        print(f"[!] Nepodařilo se zjistit ID automaticky ({e}).")
-        if sys.stdin.isatty():
-            chatroom_id = int(input(
-                "Zadej chatroom_id ručně (najdeš ho na "
-                f"https://kick.com/api/v2/channels/{slug} v poli \"chatroom\":{{\"id\":...}}): "
-            ))
-            channel_id = int(input(
-                "Zadej channel_id ručně (najdeš ho na stejné stránce v poli \"id\":...): "
-            ))
-        else:
-            # na serveru (Railway) není terminál pro ruční zadání - zkusíme to znovu za chvíli
-            print("[!] Server bez terminálu, zkouším znovu za 15s...")
+    while True:
+        try:
+            channel_id, chatroom_id = get_ids(slug)
+            break
+        except Exception as exc:
+            print(f"[!] Could not resolve Kick IDs ({exc}); retrying in 15s.")
             time.sleep(15)
-            return main()
 
-    print(f"[i] Připojuji se ke streamu '{slug}'... (Ctrl+C pro ukončení)")
-    print(f"[i] Odběratelé se budou zapisovat do {OUT_CSV}")
-    print(f"[i] Syrové eventy (pro debug) se logují do {RAW_LOG}")
-
+    print(f"[i] Connecting to Kick/Pusher for {slug}...")
     while True:
         ws = websocket.WebSocketApp(
             PUSHER_WS_URL,
@@ -987,11 +650,433 @@ def main():
         try:
             ws.run_forever(ping_interval=30, ping_timeout=10)
         except KeyboardInterrupt:
-            print(f"\n[i] Konec. Celkem zaznamenáno odběrů: {sub_count}")
-            break
+            raise
+        except Exception as exc:
+            print(f"[!] Pusher loop error: {exc}")
 
-        print("[i] Spojení spadlo, zkouším znovu za 5s...")
+        print("[i] Pusher connection dropped; reconnecting in 5s.")
         time.sleep(5)
+
+
+def maybe_auto_subscribe_official_events() -> None:
+    if not truthy_env("AUTO_SUBSCRIBE_EVENTS"):
+        return
+
+    token = os.environ.get("KICK_API_ACCESS_TOKEN")
+    broadcaster_id = os.environ.get("KICK_BROADCASTER_USER_ID")
+    if not token or not broadcaster_id:
+        print("[!] AUTO_SUBSCRIBE_EVENTS=1 requires KICK_API_ACCESS_TOKEN and KICK_BROADCASTER_USER_ID.")
+        return
+
+    payload = {
+        "broadcaster_user_id": safe_int(broadcaster_id, 0),
+        "events": [{"name": name, "version": 1} for name in sorted(OFFICIAL_SUB_EVENTS)],
+    }
+    try:
+        resp = requests.post(
+            "https://api.kick.com/public/v1/events/subscriptions",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=15,
+        )
+        if resp.status_code >= 400:
+            print(f"[!] Kick event subscription setup failed: {resp.status_code} {resp.text}")
+        else:
+            print("[i] Official Kick event subscriptions requested.")
+    except Exception as exc:
+        print(f"[!] Kick event subscription setup failed: {exc}")
+
+
+def start_file_server(slug: str) -> None:
+    app = Flask(__name__)
+
+    def admin_allowed() -> bool:
+        token = os.environ.get("ADMIN_TOKEN")
+        if not token:
+            return True
+        return request.args.get("admin") == token or request.headers.get("X-Admin-Token") == token
+
+    def admin_qs() -> str:
+        token = request.args.get("admin")
+        if token and os.environ.get("ADMIN_TOKEN") == token:
+            return "?admin=" + html.escape(token, quote=True)
+        return ""
+
+    def download_link(filename: str) -> str:
+        qs = admin_qs()
+        return f"/{filename}{qs}"
+
+    @app.route("/health")
+    def health() -> Any:
+        return jsonify(ok=True, channel=slug, rows=len(read_rows()))
+
+    @app.route("/kick/webhook", methods=["POST"])
+    def kick_webhook() -> Any:
+        expected = os.environ.get("WEBHOOK_TOKEN")
+        provided = request.args.get("token") or request.headers.get("X-Webhook-Token")
+        if expected and provided != expected:
+            return jsonify(ok=False, error="forbidden"), 403
+
+        payload = request.get_json(silent=True) or {}
+        if not isinstance(payload, dict):
+            return jsonify(ok=False, error="invalid_json"), 400
+
+        headers = {k: v for k, v in request.headers.items() if k.lower().startswith(("kick-", "x-kick-"))}
+        event_type = request.headers.get("Kick-Event-Type") or request.args.get("event") or payload.get("event")
+        event_type = str(event_type or "").strip()
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+
+        log_raw("webhook", event_type or "unknown", data, headers)
+        if event_type not in OFFICIAL_SUB_EVENTS:
+            return jsonify(ok=True, recorded=False, ignored=event_type)
+
+        recorded = handle_official_kick_event(event_type, data, headers)
+        return jsonify(ok=True, recorded=recorded)
+
+    @app.route("/")
+    def index() -> str:
+        rows = read_rows()
+        recent = list(reversed(rows[-50:]))
+        if recent:
+            row_html = "\n".join(render_table_row(row) for row in recent)
+        else:
+            row_html = '<div class="empty-row">Zadne jmeno zatim zaznamenane - cekam na prvni sub/gift.</div>'
+
+        qs = admin_qs()
+        count = len(rows)
+        names_filename = html.escape(NAMES_FILE.name)
+        csv_filename = html.escape(OUT_CSV.name)
+        raw_filename = html.escape(RAW_LOG.name)
+
+        return f"""<!doctype html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="15">
+<title>{html.escape(slug)} - kick-sub-tracker</title>
+<style>
+:root {{
+  --bg:#050505; --panel:#0b0b0b; --border:rgba(255,255,255,.1);
+  --soft:rgba(255,255,255,.055); --text:#efefef; --muted:#777; --sub:#aaa;
+  --white:#f3f3f3; --green:#55c878; --red:#ff695f;
+}}
+* {{ box-sizing:border-box; }}
+body {{ margin:0; min-height:100vh; background:var(--bg); color:var(--text);
+  font-family:Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
+  display:flex; justify-content:center; padding:72px 20px; }}
+main {{ width:100%; max-width:720px; }}
+header {{ display:flex; align-items:center; justify-content:space-between; margin-bottom:28px; }}
+.brand {{ display:flex; gap:12px; align-items:center; }}
+.mark {{ width:34px; height:34px; display:grid; place-items:center; border:1px solid var(--border);
+  border-radius:8px; font:600 12px ui-monospace, SFMono-Regular, Consolas, monospace; color:var(--sub); }}
+h1 {{ margin:0; font-size:15px; }}
+.path {{ color:var(--muted); font:12px ui-monospace, SFMono-Regular, Consolas, monospace; margin-top:2px; }}
+.nav {{ color:var(--sub); text-decoration:none; border:1px solid var(--border); border-radius:8px; padding:8px 13px; font-size:13px; }}
+.panel {{ background:var(--panel); border:1px solid var(--border); border-radius:12px; overflow:hidden; margin-bottom:16px; }}
+.meta {{ display:grid; grid-template-columns:repeat(3, 1fr); }}
+.meta > div {{ padding:18px 20px; border-right:1px solid var(--soft); }}
+.meta > div:last-child {{ border-right:0; }}
+.k {{ color:var(--muted); text-transform:uppercase; letter-spacing:.06em; font-size:11px; margin-bottom:8px; }}
+.v {{ font:600 21px ui-monospace, SFMono-Regular, Consolas, monospace; }}
+.v.small {{ font-size:14px; }}
+.actions {{ display:grid; grid-template-columns:repeat(3, 1fr); gap:8px; margin-bottom:16px; }}
+.btn {{ text-align:center; text-decoration:none; padding:11px 14px; border-radius:8px; border:1px solid var(--border); color:var(--text); font-size:13px; }}
+.btn.primary {{ background:var(--white); color:#090909; border-color:var(--white); font-weight:600; }}
+.head,.row {{ display:grid; grid-template-columns:minmax(120px,1fr) 145px 72px 36px; align-items:center; gap:12px; }}
+.head {{ padding:11px 20px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; font-size:11px; border-bottom:1px solid var(--soft); }}
+.row {{ padding:13px 20px; border-bottom:1px solid var(--soft); font-size:13px; }}
+.row:last-child {{ border-bottom:0; }}
+.name {{ font-family:ui-monospace, SFMono-Regular, Consolas, monospace; overflow:hidden; text-overflow:ellipsis; }}
+.type,.qty {{ color:var(--sub); }}
+.qty {{ text-align:right; font-family:ui-monospace, SFMono-Regular, Consolas, monospace; }}
+.del {{ background:transparent; color:var(--muted); border:0; font-size:18px; cursor:pointer; border-radius:6px; padding:4px; }}
+.del:hover {{ color:var(--red); background:rgba(255,105,95,.09); }}
+.empty-row {{ color:var(--muted); text-align:center; padding:34px 20px; font-size:13px; }}
+footer {{ color:var(--muted); display:flex; justify-content:space-between; font-size:12px; padding:3px 2px; }}
+@media (max-width:620px) {{
+  body {{ padding:32px 12px; }}
+  .meta,.actions {{ grid-template-columns:1fr; }}
+  .meta > div {{ border-right:0; border-bottom:1px solid var(--soft); }}
+  .head,.row {{ grid-template-columns:minmax(100px,1fr) 90px 48px 32px; gap:8px; padding-left:12px; padding-right:12px; }}
+}}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="brand"><div class="mark">KS</div><div><h1>kick-sub-tracker</h1><div class="path">{html.escape(slug)}</div></div></div>
+    <a class="nav" href="/wheel{qs}">Kolo stesti -></a>
+  </header>
+  <section class="panel"><div class="meta">
+    <div><div class="k">Zaznamenano</div><div class="v">{count}</div></div>
+    <div><div class="k">Kanal</div><div class="v small">{html.escape(slug)}</div></div>
+    <div><div class="k">Zdroj</div><div class="v small">webhook + pusher</div></div>
+  </div></section>
+  <nav class="actions">
+    <a class="btn primary" href="{download_link(names_filename)}">Stahnout jmena (.txt)</a>
+    <a class="btn" href="{download_link(csv_filename)}">Export detailu (.csv)</a>
+    <a class="btn" href="{download_link(raw_filename)}">Raw eventy</a>
+  </nav>
+  <section class="panel">
+    <div class="head"><div>Jmeno</div><div>Typ</div><div class="qty">Pocet</div><div></div></div>
+    {row_html}
+  </section>
+  <footer><span>auto-refresh 15s</span><span>/kick/webhook ready</span></footer>
+</main>
+<script>
+const adminToken = new URLSearchParams(location.search).get('admin') || '';
+document.querySelectorAll('.del').forEach((btn) => {{
+  btn.addEventListener('click', async () => {{
+    const name = btn.dataset.name;
+    if (!confirm('Smazat ' + name + ' uplne i z kola?')) return;
+    btn.disabled = true;
+    const url = '/delete' + (adminToken ? '?admin=' + encodeURIComponent(adminToken) : '');
+    const resp = await fetch(url, {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json', 'X-Admin-Token': adminToken }},
+      body: JSON.stringify({{ name }})
+    }});
+    const data = await resp.json().catch(() => ({{ ok:false }}));
+    if (data.ok) btn.closest('.row').remove();
+    else btn.disabled = false;
+  }});
+}});
+</script>
+</body>
+</html>"""
+
+    def render_table_row(row: dict[str, str]) -> str:
+        name = row.get("username", "")
+        name_attr = html.escape(name, quote=True)
+        return (
+            '<div class="row">'
+            f'<div class="name">{html.escape(name)}</div>'
+            f'<div class="type">{html.escape(row.get("type", ""))}</div>'
+            f'<div class="qty">{html.escape(row.get("quantity", "1"))}</div>'
+            f'<button class="del" data-name="{name_attr}" title="Smazat">x</button>'
+            "</div>"
+        )
+
+    @app.route("/delete", methods=["POST"])
+    def delete_name() -> Any:
+        if not admin_allowed():
+            return jsonify(ok=False, error="forbidden"), 403
+        payload = request.get_json(silent=True) or {}
+        name = (payload.get("name") or "").strip()
+        if not name:
+            return jsonify(ok=False, error="missing_name"), 400
+        return jsonify(ok=remove_username_completely(name))
+
+    @app.route("/wheel")
+    def wheel() -> str:
+        names = []
+        if NAMES_FILE.exists():
+            names = [line.strip() for line in NAMES_FILE.read_text(encoding="utf-8").splitlines() if line.strip()]
+        names = names[-500:]
+
+        qs = admin_qs()
+        if not names:
+            content = '<div class="empty">Zatim nejsou zadne listky. Jakmile prijde sub nebo gift, kolo se naplni.</div>'
+            script = ""
+        else:
+            names_json = json.dumps(names, ensure_ascii=False).replace("</", "<\\/")
+            content = """
+<div class="wheel-wrap">
+  <div class="pointer"></div>
+  <canvas id="wheel" width="700" height="700"></canvas>
+  <div class="hub"></div>
+</div>
+<button id="spin" class="spin">Roztocit kolo</button>
+<div id="meta" class="meta-line"></div>
+<div id="result" class="result">
+  <div class="label">Vitez</div>
+  <div id="winner" class="winner"></div>
+  <div class="result-actions">
+    <button id="remove" class="remove">Odebrat jeden listek</button>
+    <button id="keep" class="keep">Nechat na kole</button>
+  </div>
+  <div id="status" class="status"></div>
+</div>
+"""
+            script = f"""
+const names = {names_json};
+const canvas = document.getElementById('wheel');
+const ctx = canvas.getContext('2d');
+const size = canvas.width;
+const center = size / 2;
+const radius = center - 4;
+let rotation = 0;
+document.getElementById('meta').textContent = names.length + ' listku na kole';
+
+function draw() {{
+  const n = names.length;
+  const arc = Math.PI * 2 / n;
+  ctx.clearRect(0, 0, size, size);
+  for (let i = 0; i < n; i++) {{
+    const start = i * arc;
+    ctx.beginPath();
+    ctx.moveTo(center, center);
+    ctx.arc(center, center, radius, start, start + arc);
+    ctx.closePath();
+    ctx.fillStyle = i % 2 ? '#101113' : '#1a1b1f';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,.06)';
+    ctx.stroke();
+    if (n <= 42) {{
+      ctx.save();
+      ctx.translate(center, center);
+      ctx.rotate(start + arc / 2);
+      ctx.textAlign = 'right';
+      ctx.fillStyle = '#efefef';
+      ctx.font = '14px ui-monospace, Consolas, monospace';
+      ctx.fillText(names[i], radius - 16, 5);
+      ctx.restore();
+    }}
+  }}
+}}
+draw();
+
+document.getElementById('spin').addEventListener('click', () => {{
+  const btn = document.getElementById('spin');
+  const result = document.getElementById('result');
+  btn.disabled = true;
+  result.style.display = 'none';
+  const n = names.length;
+  const winnerIndex = Math.floor(Math.random() * n);
+  const arcDeg = 360 / n;
+  const target = winnerIndex * arcDeg + arcDeg / 2;
+  rotation += 6 * 360 + (360 - target);
+  canvas.style.transform = `rotate(${{rotation}}deg)`;
+  setTimeout(() => {{
+    document.getElementById('winner').textContent = names[winnerIndex];
+    result.style.display = 'block';
+    btn.disabled = false;
+  }}, 4700);
+}});
+
+document.getElementById('keep').addEventListener('click', () => {{
+  document.getElementById('result').style.display = 'none';
+}});
+
+document.getElementById('remove').addEventListener('click', async () => {{
+  const winner = document.getElementById('winner').textContent;
+  const adminToken = new URLSearchParams(location.search).get('admin') || '';
+  const url = '/wheel/remove' + (adminToken ? '?admin=' + encodeURIComponent(adminToken) : '');
+  document.getElementById('status').textContent = 'Odebiram...';
+  const resp = await fetch(url, {{
+    method: 'POST',
+    headers: {{ 'Content-Type': 'application/json', 'X-Admin-Token': adminToken }},
+    body: JSON.stringify({{ name: winner }})
+  }});
+  const data = await resp.json().catch(() => ({{ ok:false }}));
+  if (data.ok) {{
+    document.getElementById('status').textContent = 'Odebrano, zbyva ' + data.remaining + 'x.';
+    setTimeout(() => location.reload(), 900);
+  }} else {{
+    document.getElementById('status').textContent = 'Nepovedlo se odebrat.';
+  }}
+}});
+"""
+
+        return f"""<!doctype html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kolo stesti - {html.escape(slug)}</title>
+<style>
+:root {{ --bg:#050505; --panel:#0b0b0b; --border:rgba(255,255,255,.1); --text:#efefef; --muted:#777; --white:#f3f3f3; --green:#55c878; --red:#ff695f; }}
+* {{ box-sizing:border-box; }}
+body {{ margin:0; min-height:100vh; background:var(--bg); color:var(--text); font-family:Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; display:flex; align-items:center; flex-direction:column; padding:48px 20px; }}
+header {{ width:100%; max-width:560px; display:flex; align-items:center; justify-content:space-between; margin-bottom:28px; }}
+h1 {{ margin:0; font-size:16px; }}
+.path {{ color:var(--muted); font:12px ui-monospace, SFMono-Regular, Consolas, monospace; margin-top:3px; }}
+.nav {{ color:#aaa; text-decoration:none; border:1px solid var(--border); border-radius:8px; padding:8px 13px; font-size:13px; }}
+.wheel-wrap {{ width:440px; max-width:88vw; position:relative; margin-bottom:24px; }}
+canvas {{ width:100%; height:auto; border-radius:50%; border:1px solid var(--border); transition:transform 4.6s cubic-bezier(.17,.67,.12,.99); }}
+.pointer {{ position:absolute; left:50%; top:-3px; transform:translateX(-50%); width:0; height:0; border-left:13px solid transparent; border-right:13px solid transparent; border-top:22px solid var(--white); z-index:2; }}
+.hub {{ position:absolute; left:50%; top:50%; transform:translate(-50%, -50%); width:16px; height:16px; border-radius:50%; background:var(--white); }}
+.spin {{ background:var(--white); color:#080808; border:0; border-radius:9px; padding:12px 28px; font-weight:700; cursor:pointer; }}
+.spin:disabled {{ opacity:.55; cursor:not-allowed; }}
+.meta-line {{ margin-top:13px; color:var(--muted); font:12px ui-monospace, SFMono-Regular, Consolas, monospace; }}
+.result {{ display:none; margin-top:24px; text-align:center; border:1px solid var(--border); background:var(--panel); border-radius:12px; padding:20px 28px; }}
+.label {{ color:var(--muted); text-transform:uppercase; letter-spacing:.07em; font-size:11px; margin-bottom:8px; }}
+.winner {{ color:var(--green); font:700 24px ui-monospace, SFMono-Regular, Consolas, monospace; margin-bottom:16px; }}
+.result-actions {{ display:flex; gap:8px; }}
+.remove,.keep {{ border:1px solid var(--border); background:transparent; color:var(--text); border-radius:8px; padding:9px 13px; cursor:pointer; }}
+.remove {{ color:var(--red); border-color:rgba(255,105,95,.45); }}
+.status,.empty {{ color:var(--muted); margin-top:12px; font-size:13px; text-align:center; }}
+</style>
+</head>
+<body>
+<header><div><h1>Kolo stesti</h1><div class="path">{html.escape(slug)}</div></div><a class="nav" href="/{qs}">&lt;- Prehled</a></header>
+{content}
+<script>{script}</script>
+</body>
+</html>"""
+
+    @app.route("/wheel/remove", methods=["POST"])
+    def wheel_remove() -> Any:
+        if not admin_allowed():
+            return jsonify(ok=False, error="forbidden"), 403
+        payload = request.get_json(silent=True) or {}
+        name = (payload.get("name") or "").strip()
+        if not name:
+            return jsonify(ok=False, error="missing_name"), 400
+        removed = remove_one_ticket(name)
+        remaining = 0
+        if NAMES_FILE.exists():
+            remaining = sum(1 for line in NAMES_FILE.read_text(encoding="utf-8").splitlines() if line == name)
+        return jsonify(ok=removed, remaining=remaining)
+
+    @app.route(f"/{NAMES_FILE.name}")
+    def names_file() -> Any:
+        if not NAMES_FILE.exists():
+            abort(404)
+        return send_file(NAMES_FILE, as_attachment=True)
+
+    @app.route(f"/{OUT_CSV.name}")
+    def csv_file() -> Any:
+        if not OUT_CSV.exists():
+            abort(404)
+        return send_file(OUT_CSV, as_attachment=True)
+
+    @app.route(f"/{RAW_LOG.name}")
+    def raw_file() -> Any:
+        if not RAW_LOG.exists():
+            abort(404)
+        return send_file(RAW_LOG, as_attachment=True)
+
+    port = int(os.environ.get("PORT", "8080"))
+    thread = threading.Thread(
+        target=lambda: app.run(host="0.0.0.0", port=port, use_reloader=False),
+        daemon=True,
+    )
+    thread.start()
+    print(f"[i] Web UI running on port {port}. Official webhook: /kick/webhook")
+
+
+def main() -> None:
+    slug = os.environ.get("KICK_CHANNEL") or (sys.argv[1] if len(sys.argv) > 1 else "tyblaho69")
+    ensure_storage()
+    start_file_server(slug)
+    maybe_auto_subscribe_official_events()
+
+    print(f"[i] Data dir: {DATA_DIR}")
+    print(f"[i] CSV: {OUT_CSV}")
+    print(f"[i] Wheel names: {NAMES_FILE}")
+    print(f"[i] Official webhook events: {', '.join(sorted(OFFICIAL_SUB_EVENTS))}")
+
+    if not ENABLE_PUSHER:
+        print("[i] ENABLE_PUSHER=0, running webhook/UI only.")
+        while True:
+            time.sleep(3600)
+
+    try:
+        run_pusher_loop(slug)
+    except KeyboardInterrupt:
+        print("\n[i] Stopped.")
 
 
 if __name__ == "__main__":
