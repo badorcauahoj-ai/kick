@@ -41,6 +41,20 @@ erase subscriber history. Only enable it intentionally (together with
 ALLOW_PERMANENT_DELETE=1
 ```
 
+## Internal wheel rehearsal
+
+For a rehearsal that is visibly labelled `TEST REZIM` on the wheel page, set:
+
+```txt
+WHEEL_TEST_MODE=1
+WHEEL_TEST_WINNERS=*,jasmiinaa222,*
+```
+
+Each comma-separated position represents one spin. `*` means a normal random
+result; a username selects one of that user's existing tickets. The example
+therefore makes the second of three spins select `jasmiinaa222`. Remove both
+variables after the rehearsal. With no test variables, every spin is random.
+
 ## Kick webhook
 
 Use this webhook URL, replacing the token with your Railway `WEBHOOK_TOKEN`:
