@@ -27,6 +27,20 @@ Add a Railway volume mounted at:
 /data
 ```
 
+`/data` is required for persistence. It contains `subscribers.csv`, the
+durable event ledger, and the wheel ticket cache. If the cache file is ever
+missing, the app recreates every ticket from `subscribers.csv` at startup.
+Do not use Railway's ephemeral filesystem for `DATA_DIR`, or data will be
+lost on a redeploy.
+
+The permanent-delete control is disabled by default, so a public wheel cannot
+erase subscriber history. Only enable it intentionally (together with
+`ADMIN_TOKEN`) if you really need it:
+
+```txt
+ALLOW_PERMANENT_DELETE=1
+```
+
 ## Kick webhook
 
 Use this webhook URL, replacing the token with your Railway `WEBHOOK_TOKEN`:

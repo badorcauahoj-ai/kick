@@ -36,6 +36,7 @@ import html
 import json
 import os
 import re
+import secrets
 import sys
 import threading
 import time
@@ -124,9 +125,18 @@ def ensure_storage() -> None:
             csv.writer(f).writerow(CSV_HEADER)
     else:
         migrate_csv_if_needed()
-    if not NAMES_FILE.exists():
+    # `subscribers.csv` is the durable event ledger.  The text file is a
+    # convenient, weighted cache for the wheel and can always be restored
+    # from that ledger if a deploy or an accidental file removal loses it.
+    names_file_was_missing = not NAMES_FILE.exists()
+    if names_file_was_missing:
         NAMES_FILE.touch()
     load_seen_events()
+    if names_file_was_missing:
+        with lock:
+            restored = rebuild_wheel_tickets_unlocked()
+        if restored:
+            print(f"[i] Restored {restored} wheel tickets from {OUT_CSV}.")
 
 
 def migrate_csv_if_needed() -> None:
@@ -231,6 +241,27 @@ def append_wheel_tickets_unlocked(username: str, weight: int) -> None:
     with NAMES_FILE.open("a", encoding="utf-8") as f:
         for _ in range(max(1, weight)):
             f.write(username + "\n")
+
+
+def wheel_ticket_weight(row: dict[str, str]) -> int:
+    """Return the number of tickets represented by one ledger entry."""
+    if row.get("type") == "gift_subscription":
+        return max(1, safe_int(row.get("quantity"), 1))
+    return 1
+
+
+def rebuild_wheel_tickets_unlocked() -> int:
+    """Recreate the wheel cache from the CSV ledger without dropping names."""
+    tickets: list[str] = []
+    for row in read_rows_unlocked():
+        username = normalize_username(row.get("username"))
+        if username:
+            tickets.extend([username] * wheel_ticket_weight(row))
+
+    tmp = NAMES_FILE.with_suffix(".tmp")
+    tmp.write_text("\n".join(tickets) + ("\n" if tickets else ""), encoding="utf-8")
+    tmp.replace(NAMES_FILE)
+    return len(tickets)
 
 
 def record_entry(
@@ -693,8 +724,13 @@ def start_file_server(slug: str) -> None:
     def admin_allowed() -> bool:
         token = os.environ.get("ADMIN_TOKEN")
         if not token:
-            return True
-        return request.args.get("admin") == token or request.headers.get("X-Admin-Token") == token
+            # A public wheel must never also expose a public delete endpoint.
+            return False
+        provided = request.args.get("admin") or request.headers.get("X-Admin-Token")
+        return bool(provided) and secrets.compare_digest(provided, token)
+
+    def permanent_deletion_enabled() -> bool:
+        return bool(os.environ.get("ADMIN_TOKEN")) and truthy_env("ALLOW_PERMANENT_DELETE")
 
     def admin_qs() -> str:
         token = request.args.get("admin")
@@ -849,18 +885,23 @@ document.querySelectorAll('.del').forEach((btn) => {{
     def render_table_row(row: dict[str, str]) -> str:
         name = row.get("username", "")
         name_attr = html.escape(name, quote=True)
+        delete_button = (
+            f'<button class="del" data-name="{name_attr}" title="Smazat">x</button>'
+            if permanent_deletion_enabled()
+            else ""
+        )
         return (
             '<div class="row">'
             f'<div class="name">{html.escape(name)}</div>'
             f'<div class="type">{html.escape(row.get("type", ""))}</div>'
             f'<div class="qty">{html.escape(row.get("quantity", "1"))}</div>'
-            f'<button class="del" data-name="{name_attr}" title="Smazat">x</button>'
+            f"{delete_button}"
             "</div>"
         )
 
     @app.route("/delete", methods=["POST"])
     def delete_name() -> Any:
-        if not admin_allowed():
+        if not permanent_deletion_enabled() or not admin_allowed():
             return jsonify(ok=False, error="forbidden"), 403
         payload = request.get_json(silent=True) or {}
         name = (payload.get("name") or "").strip()
@@ -873,7 +914,6 @@ document.querySelectorAll('.del').forEach((btn) => {{
         names = []
         if NAMES_FILE.exists():
             names = [line.strip() for line in NAMES_FILE.read_text(encoding="utf-8").splitlines() if line.strip()]
-        names = names[-500:]
 
         qs = admin_qs()
         if not names:
@@ -929,7 +969,7 @@ function draw() {{
       ctx.rotate(start + arc / 2);
       ctx.textAlign = 'right';
       ctx.fillStyle = '#efefef';
-      ctx.font = '14px ui-monospace, Consolas, monospace';
+      ctx.font = (n <= 16 ? '20px' : '16px') + ' ui-monospace, Consolas, monospace';
       ctx.fillText(names[i], radius - 16, 5);
       ctx.restore();
     }}
@@ -946,7 +986,13 @@ document.getElementById('spin').addEventListener('click', () => {{
   const winnerIndex = Math.floor(Math.random() * n);
   const arcDeg = 360 / n;
   const target = winnerIndex * arcDeg + arcDeg / 2;
-  rotation += 6 * 360 + (360 - target);
+  // The pointer is at 12 o'clock (270 degrees in canvas coordinates).
+  // Account for the current rotation too, otherwise a second spin lands on
+  // another slice than the name we announce as the winner.
+  const pointerAngle = 270;
+  const currentAngle = ((rotation % 360) + 360) % 360;
+  const finishDelta = (pointerAngle - target - currentAngle + 360) % 360;
+  rotation += 6 * 360 + finishDelta;
   canvas.style.transform = `rotate(${{rotation}}deg)`;
   setTimeout(() => {{
     document.getElementById('winner').textContent = names[winnerIndex];
