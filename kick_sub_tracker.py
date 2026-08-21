@@ -1259,30 +1259,12 @@ document.querySelectorAll('.del').forEach((btn) => {{
         if NAMES_FILE.exists():
             names = [line.strip() for line in NAMES_FILE.read_text(encoding="utf-8").splitlines() if line.strip()]
 
-        # This is deliberately opt-in and visibly labelled in the page.  It
-        # exists for rehearsals only; production spins stay random by default.
-        test_winners: list[str] = []
-        if truthy_env("WHEEL_TEST_MODE"):
-            test_winners = [
-                username
-                for username in (
-                    normalize_username(value) for value in os.environ.get("WHEEL_TEST_WINNERS", "").split(",")
-                )
-                if username
-            ]
-
         qs = admin_qs()
         if not names:
             content = '<div class="empty">Zatim nejsou zadne listky. Jakmile prijde sub nebo gift, kolo se naplni.</div>'
             script = ""
         else:
             names_json = json.dumps(names, ensure_ascii=False).replace("</", "<\\/")
-            test_winners_json = json.dumps(test_winners, ensure_ascii=False).replace("</", "<\\/")
-            test_notice = (
-                '<div class="test-mode">TEST REZIM: predvolene vysledky jsou zapnute.</div>'
-                if test_winners
-                else ""
-            )
             content = """
 <div class="wheel-wrap">
   <div class="pointer"></div>
@@ -1291,7 +1273,6 @@ document.querySelectorAll('.del').forEach((btn) => {{
 </div>
 <button id="spin" class="spin">Roztocit kolo</button>
 <div id="meta" class="meta-line"></div>
-""" + test_notice + """
 <div id="result" class="result">
   <div class="label">Vitez</div>
   <div id="winner" class="winner"></div>
@@ -1304,8 +1285,6 @@ document.querySelectorAll('.del').forEach((btn) => {{
 """
             script = f"""
 const names = {names_json};
-const testWinners = {test_winners_json};
-let testSpin = 0;
 const canvas = document.getElementById('wheel');
 const ctx = canvas.getContext('2d');
 const size = canvas.width;
@@ -1356,36 +1335,16 @@ document.getElementById('spin').addEventListener('click', () => {{
   btn.disabled = true;
   result.style.display = 'none';
   const n = names.length;
-  // testSpin se inkrementuje při čtení testWinners[testSpin++]
-// takže hodnoty jsou: 0 = 1. spin, 1 = 2. spin, 2 = 3. spin
-
-let configuredWinner = testWinners[testSpin++] || '';
-
-
-if test_spin == 3:
-    user = next((u for u in db_users if u.username == "kikiii808"), None)
-    if user:
-        configured_winner = "kikiii808"
-
-# Najdi index výherce
-if configured_winner:
-    configured_index = winner_index_for(configured_winner)
-else:
-    configured_index = -1
-
-# Pokud máme validní index → použijeme ho
-# Jinak → náhodný výběr
-winner_index = configured_index if configured_index >= 0 else random.randint(0, n - 1)
-
-arc_deg = 360 / n
-target = winner_index * arc_deg + arc_deg / 2
-
-pointer_angle = 270
-current_angle = ((rotation % 360) + 360) % 360
-finish_delta = (pointer_angle - target - current_angle + 360) % 360
-
-rotation += 6 * 360 + finish_delta
-
+  const winnerIndex = Math.floor(Math.random() * n);
+  const arcDeg = 360 / n;
+  const target = winnerIndex * arcDeg + arcDeg / 2;
+  // The pointer is at 12 o'clock (270 degrees in canvas coordinates).
+  // Account for the current rotation too, otherwise a second spin lands on
+  // another slice than the name we announce as the winner.
+  const pointerAngle = 270;
+  const currentAngle = ((rotation % 360) + 360) % 360;
+  const finishDelta = (pointerAngle - target - currentAngle + 360) % 360;
+  rotation += 6 * 360 + finishDelta;
   canvas.style.transform = `rotate(${{rotation}}deg)`;
   setTimeout(() => {{
     document.getElementById('winner').textContent = names[winnerIndex];
@@ -1439,7 +1398,6 @@ canvas {{ width:100%; height:auto; border-radius:50%; border:1px solid var(--bor
 .spin {{ background:var(--white); color:#080808; border:0; border-radius:9px; padding:12px 28px; font-weight:700; cursor:pointer; }}
 .spin:disabled {{ opacity:.55; cursor:not-allowed; }}
 .meta-line {{ margin-top:13px; color:var(--muted); font:12px ui-monospace, SFMono-Regular, Consolas, monospace; }}
-.test-mode {{ margin-top:10px; color:#f6c453; font-size:12px; text-align:center; letter-spacing:.04em; }}
 .result {{ display:none; margin-top:24px; text-align:center; border:1px solid var(--border); background:var(--panel); border-radius:12px; padding:20px 28px; }}
 .label {{ color:var(--muted); text-transform:uppercase; letter-spacing:.07em; font-size:11px; margin-bottom:8px; }}
 .winner {{ color:var(--green); font:700 24px ui-monospace, SFMono-Regular, Consolas, monospace; margin-bottom:16px; }}
