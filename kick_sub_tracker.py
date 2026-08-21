@@ -590,6 +590,15 @@ def extract_from_pusher(event_name: str, data: dict[str, Any]) -> None:
         return
 
     if event_name == "App\\Events\\GiftsLeaderboardUpdated":
+        # Kick sends the actual gift that caused this update at the top level.
+        # Reading only `leaderboard` loses a gift from a new/non-top donor and
+        # depends on an in-memory previous total, which is reset on restart.
+        record_pusher_gift(
+            event_name,
+            data,
+            recipient_fields=("gifted_usernames", "usernames", "giftees"),
+            source="pusher_gift_leaderboard_event",
+        )
         for entry in data.get("leaderboard", []) or []:
             username = normalize_username(entry.get("username"))
             quantity = safe_int(entry.get("quantity"), 0)

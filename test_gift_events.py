@@ -76,6 +76,27 @@ class GiftedSubscriptionEventTests(unittest.TestCase):
             ["zuzk_engova", "zuzk_engova", "zuzk_engova"],
         )
 
+    def test_leaderboard_update_uses_the_actual_gift_not_the_historical_total(self):
+        tracker.extract_from_pusher(
+            "App\\Events\\GiftsLeaderboardUpdated",
+            {
+                "gifter_username": "theuska",
+                "gifted_quantity": 15,
+                "leaderboard": [
+                    {"username": "theuska", "quantity": 89},
+                ],
+            },
+        )
+
+        rows = tracker.read_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["username"], "theuska")
+        self.assertEqual(rows[0]["quantity"], "15")
+        self.assertEqual(
+            tracker.NAMES_FILE.read_text(encoding="utf-8").splitlines(),
+            ["theuska"] * 15,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
