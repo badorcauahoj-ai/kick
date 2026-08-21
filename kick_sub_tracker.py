@@ -1321,32 +1321,29 @@ document.getElementById('spin').addEventListener('click', () => {{
 let configuredWinner = testWinners[testSpin++] || '';
 
 
-if (testSpin === 2) {   // třetí vytočení (0-based)
-    const user = dbUsers.find(u => u.username === "kikiii808");
-    if (user) {
-        configuredWinner = "kikiii808";
-    }
-}
+if test_spin == 3:
+    user = next((u for u in db_users if u.username == "kikiii808"), None)
+    if user:
+        configured_winner = "kikiii808"
 
-const configuredIndex = configuredWinner
-  ? winnerIndexFor(configuredWinner)
-  : -1;
+# Najdi index výherce
+if configured_winner:
+    configured_index = winner_index_for(configured_winner)
+else:
+    configured_index = -1
 
-const winnerIndex = configuredIndex >= 0
-  ? configuredIndex
-  : Math.floor(Math.random() * n);
+# Pokud máme validní index → použijeme ho
+# Jinak → náhodný výběr
+winner_index = configured_index if configured_index >= 0 else random.randint(0, n - 1)
 
-const arcDeg = 360 / n;
-const target = winnerIndex * arcDeg + arcDeg / 2;
+arc_deg = 360 / n
+target = winner_index * arc_deg + arc_deg / 2
 
-// The pointer is at 12 o'clock (270 degrees in canvas coordinates).
-// Account for the current rotation too, otherwise a second spin lands on
-// another slice than the name we announce as the winner.
-const pointerAngle = 270;
-const currentAngle = ((rotation % 360) + 360) % 360;
-const finishDelta = (pointerAngle - target - currentAngle + 360) % 360;
+pointer_angle = 270
+current_angle = ((rotation % 360) + 360) % 360
+finish_delta = (pointer_angle - target - current_angle + 360) % 360
 
-rotation += 6 * 360 + finishDelta;
+rotation += 6 * 360 + finish_delta
 
   canvas.style.transform = `rotate(${{rotation}}deg)`;
   setTimeout(() => {{
