@@ -452,6 +452,47 @@ def pusher_event_key(event_name: str, data: dict[str, Any]) -> str:
     return fingerprint(f"pusher:{event_name}", data)
 
 
+def record_pusher_gift(
+    event_name: str,
+    data: dict[str, Any],
+    *,
+    recipient_fields: tuple[str, ...],
+    source: str,
+) -> bool:
+    """Record the buyer from Kick's direct gift-subscription Pusher event."""
+    gifter = data.get("gifter") or {}
+    username = normalize_username(
+        data.get("gifter_username")
+        or data.get("gifterUsername")
+        or (gifter.get("username") if isinstance(gifter, dict) else None)
+    )
+    if not username:
+        return False
+
+    recipients: list[Any] = []
+    for field in recipient_fields:
+        value = data.get(field)
+        if isinstance(value, list):
+            recipients = value
+            break
+
+    quantity = len(recipients) if recipients else safe_int(
+        data.get("gifted_quantity") or data.get("quantity"), 0
+    )
+    if quantity <= 0:
+        return False
+
+    return record_entry(
+        username,
+        "gift_subscription",
+        quantity=quantity,
+        source=source,
+        event_key=pusher_event_key(event_name, data),
+        note="pusher_direct_gift",
+        weight=quantity,
+    )
+
+
 def record_gifter_badge(username: str, badge_count: int) -> bool:
     username = username.strip()
     if not username:
@@ -524,9 +565,28 @@ def extract_from_pusher(event_name: str, data: dict[str, Any]) -> None:
     if event_name == "App\\Events\\ChannelSubscriptionEvent":
         return
 
+    if event_name == "App\\Events\\GiftedSubscriptionsEvent":
+        # This is the primary Pusher event for a gift.  It contains the buyer
+        # (`gifter_username`) and the users receiving the subscriptions.
+        record_pusher_gift(
+            event_name,
+            data,
+            recipient_fields=("gifted_usernames", "usernames", "giftees"),
+            source="pusher_gift",
+        )
+        return
+
     if event_name == "App\\Events\\LuckyUsersWhoGotGiftSubscriptionsEvent":
-        # This event contains giftees. For your wheel we intentionally do not
-        # record giftees; gift-sub tickets belong to the buyer/gifter.
+        # Some Kick clients expose the buyer on this companion event instead
+        # of the direct GiftedSubscriptionsEvent.  Still record the buyer,
+        # never the recipients.  A matching direct event is deduplicated by
+        # the short cross-source duplicate window in record_entry().
+        record_pusher_gift(
+            event_name,
+            data,
+            recipient_fields=("usernames", "gifted_usernames", "giftees"),
+            source="pusher_gift_recipients",
+        )
         return
 
     if event_name == "App\\Events\\GiftsLeaderboardUpdated":
