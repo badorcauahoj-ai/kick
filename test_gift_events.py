@@ -35,12 +35,14 @@ class GiftedSubscriptionEventTests(unittest.TestCase):
             tracker.NAMES_FILE,
             tracker.RAW_LOG,
             tracker.SEEN_EVENTS_FILE,
+            tracker.LEADERBOARD_TOTALS_FILE,
         )
         tracker.DATA_DIR = data_dir
         tracker.OUT_CSV = data_dir / "subscribers.csv"
         tracker.NAMES_FILE = data_dir / "subscription_names.txt"
         tracker.RAW_LOG = data_dir / "raw_events.jsonl"
         tracker.SEEN_EVENTS_FILE = data_dir / "seen_events.json"
+        tracker.LEADERBOARD_TOTALS_FILE = data_dir / "leaderboard_totals.json"
         tracker.seen_event_keys.clear()
         tracker.gifter_badge_counts.clear()
         tracker.leaderboard_gift_totals.clear()
@@ -55,6 +57,7 @@ class GiftedSubscriptionEventTests(unittest.TestCase):
             tracker.NAMES_FILE,
             tracker.RAW_LOG,
             tracker.SEEN_EVENTS_FILE,
+            tracker.LEADERBOARD_TOTALS_FILE,
         ) = self.old_paths
         tracker.seen_event_keys.clear()
         tracker.recent_text_gift_batches.clear()
@@ -119,6 +122,28 @@ class GiftedSubscriptionEventTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["username"], "theuska")
         self.assertEqual(rows[0]["quantity"], "5")
+
+    def test_weekly_leaderboard_adds_only_each_later_increase_and_survives_restart(self):
+        first = {
+            "weekly_leaderboard": [{"user_id": 12, "username": "ninja", "quantity": 10}],
+        }
+        tracker.extract_from_pusher("App\\Events\\GiftsLeaderboardUpdated", first)
+        self.assertEqual(tracker.read_rows(), [])
+
+        second = {
+            "weekly_leaderboard": [{"user_id": 12, "username": "ninja", "quantity": 14}],
+        }
+        tracker.extract_from_pusher("App\\Events\\GiftsLeaderboardUpdated", second)
+        self.assertEqual(tracker.read_rows()[0]["quantity"], "4")
+
+        tracker.leaderboard_gift_totals.clear()
+        tracker.load_leaderboard_totals()
+        third = {
+            "weekly_leaderboard": [{"user_id": 12, "username": "ninja", "quantity": 17}],
+        }
+        tracker.extract_from_pusher("App\\Events\\GiftsLeaderboardUpdated", third)
+        rows = tracker.read_rows()
+        self.assertEqual([row["quantity"] for row in rows], ["4", "3"])
 
     def test_czech_community_and_recipient_notices_record_one_gift_only(self):
         tracker.extract_from_pusher(

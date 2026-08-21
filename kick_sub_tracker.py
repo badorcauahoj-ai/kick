@@ -63,6 +63,7 @@ OUT_CSV = DATA_DIR / "subscribers.csv"
 NAMES_FILE = DATA_DIR / "subscription_names.txt"
 RAW_LOG = DATA_DIR / "raw_events.jsonl"
 SEEN_EVENTS_FILE = DATA_DIR / "seen_events.json"
+LEADERBOARD_TOTALS_FILE = DATA_DIR / "leaderboard_totals.json"
 
 CSV_HEADER = ["timestamp", "username", "type", "quantity", "source", "event_key", "note"]
 OFFICIAL_SUB_EVENTS = {
@@ -147,6 +148,7 @@ def ensure_storage() -> None:
             restored = rebuild_wheel_tickets_unlocked()
         if restored:
             print(f"[i] Restored {restored} wheel tickets from {OUT_CSV}.")
+    load_leaderboard_totals()
 
 
 def migrate_csv_if_needed() -> None:
@@ -203,6 +205,28 @@ def save_seen_events_unlocked() -> None:
     tmp = SEEN_EVENTS_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(SEEN_EVENTS_FILE)
+
+
+def load_leaderboard_totals() -> None:
+    with lock:
+        leaderboard_gift_totals.clear()
+        if not LEADERBOARD_TOTALS_FILE.exists():
+            return
+        try:
+            data = json.loads(LEADERBOARD_TOTALS_FILE.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return
+        if isinstance(data, dict):
+            for key, value in data.items():
+                total = safe_int(value, -1)
+                if total >= 0:
+                    leaderboard_gift_totals[str(key)] = total
+
+
+def save_leaderboard_totals_unlocked() -> None:
+    tmp = LEADERBOARD_TOTALS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(leaderboard_gift_totals, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(LEADERBOARD_TOTALS_FILE)
 
 
 def read_rows_unlocked() -> list[dict[str, str]]:
@@ -624,19 +648,25 @@ def record_gifter_badge(username: str, badge_count: int) -> bool:
     )
 
 
-def record_gifts_leaderboard(username: str, total_quantity: int) -> bool:
+def record_gifts_leaderboard(username: str, total_quantity: int, *, scope: str = "weekly") -> bool:
+    """Add only the increase of a persisted Kick leaderboard total."""
     username = username.strip()
     if not username:
         return False
 
     with lock:
-        prev = leaderboard_gift_totals.get(username)
-        leaderboard_gift_totals[username] = total_quantity
+        key = f"{scope}:{username.casefold()}"
+        prev = leaderboard_gift_totals.get(key)
+        if prev is None:
+            # First sighting is a baseline. The same Pusher update carries
+            # the exact current gift separately; importing the entire weekly
+            # total here would duplicate earlier gifts after every restart.
+            delta = 0
+        else:
+            delta = total_quantity - prev
+        leaderboard_gift_totals[key] = total_quantity
+        save_leaderboard_totals_unlocked()
 
-    if prev is None:
-        return False
-
-    delta = total_quantity - prev
     if delta <= 0:
         return False
 
@@ -645,8 +675,8 @@ def record_gifts_leaderboard(username: str, total_quantity: int) -> bool:
         "gift_subscription",
         quantity=delta,
         source="pusher_leaderboard",
-        event_key=f"pusher_leaderboard:{username}:{prev}->{total_quantity}",
-        note=f"leaderboard_total={total_quantity}",
+        event_key=f"pusher_leaderboard:{scope}:{username.casefold()}:{prev}->{total_quantity}",
+        note=f"{scope}_leaderboard_total={total_quantity}",
         weight=delta,
     )
 
@@ -742,7 +772,7 @@ def extract_from_pusher(event_name: str, data: dict[str, Any]) -> None:
     # occasionally delivered a gift notice under a subscription event name.
     if record_czech_gift_notice(event_name, data):
         return
-    if record_pusher_gift(
+    if event_name != "App\\Events\\GiftsLeaderboardUpdated" and record_pusher_gift(
         event_name,
         data,
         recipient_fields=("gifted_usernames", "usernames", "giftees"),
@@ -796,11 +826,15 @@ def extract_from_pusher(event_name: str, data: dict[str, Any]) -> None:
         # Reading only `leaderboard` loses a gift from a new/non-top donor and
         # depends on an in-memory previous total, which is reset on restart.
         record_leaderboard_gift_event(event_name, data)
-        for entry in data.get("leaderboard", []) or []:
+        weekly_entries = data.get("weekly_leaderboard")
+        entries = weekly_entries if isinstance(weekly_entries, list) and weekly_entries else data.get("leaderboard", [])
+        for entry in entries or []:
+            if not isinstance(entry, dict):
+                continue
             username = normalize_username(entry.get("username"))
             quantity = safe_int(entry.get("quantity"), 0)
             if username and quantity > 0:
-                record_gifts_leaderboard(username, quantity)
+                record_gifts_leaderboard(username, quantity, scope="weekly")
         return
 
     if "chatmessage" not in event_name.lower():
