@@ -85,6 +85,24 @@ class GiftedSubscriptionEventTests(unittest.TestCase):
             ["zuzk_engova", "zuzk_engova", "zuzk_engova"],
         )
 
+    def test_nested_direct_gift_payload_is_recorded(self):
+        tracker.extract_from_pusher(
+            "App\\Events\\SubscriptionEvent",
+            {
+                "payload": {
+                    "gifter": {"username": "theuska"},
+                    "giftedQuantity": 5,
+                    "event_id": "nested-gift-1",
+                }
+            },
+        )
+
+        rows = tracker.read_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["username"], "theuska")
+        self.assertEqual(rows[0]["type"], "gift_subscription")
+        self.assertEqual(rows[0]["quantity"], "5")
+
     def test_leaderboard_update_uses_the_actual_gift_not_the_historical_total(self):
         tracker.extract_from_pusher(
             "App\\Events\\GiftsLeaderboardUpdated",
@@ -115,6 +133,25 @@ class GiftedSubscriptionEventTests(unittest.TestCase):
                 "leaderboard": [
                     {"user_id": 345, "username": "theuska", "quantity": 94},
                 ],
+            },
+        )
+
+        rows = tracker.read_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["username"], "theuska")
+        self.assertEqual(rows[0]["quantity"], "5")
+
+    def test_nested_leaderboard_event_resolves_gifter_and_quantity(self):
+        tracker.extract_from_pusher(
+            "App\\Events\\GiftsLeaderboardUpdated",
+            {
+                "data": {
+                    "gifter_id": 345,
+                    "giftedQuantity": 5,
+                    "weekly_leaderboard": [
+                        {"user_id": 345, "username": "theuska", "quantity": 40},
+                    ],
+                }
             },
         )
 

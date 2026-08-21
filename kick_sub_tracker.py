@@ -541,6 +541,24 @@ def pusher_event_key(event_name: str, data: dict[str, Any]) -> str:
     return fingerprint(f"pusher:{event_name}", data)
 
 
+def pusher_payload_variants(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the known nested layouts Kick uses for the same Pusher event."""
+    variants: list[dict[str, Any]] = []
+    queue: list[dict[str, Any]] = [data]
+    seen: set[int] = set()
+    while queue:
+        candidate = queue.pop(0)
+        if id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+        variants.append(candidate)
+        for key in ("data", "payload", "event", "gift", "message", "body"):
+            nested = candidate.get(key)
+            if isinstance(nested, dict):
+                queue.append(nested)
+    return variants
+
+
 def record_pusher_gift(
     event_name: str,
     data: dict[str, Any],
@@ -549,65 +567,78 @@ def record_pusher_gift(
     source: str,
 ) -> bool:
     """Record the buyer from Kick's direct gift-subscription Pusher event."""
-    gifter = data.get("gifter") or {}
-    username = normalize_username(
-        data.get("gifter_username")
-        or data.get("gifterUsername")
-        or (gifter.get("username") if isinstance(gifter, dict) else None)
-    )
-    if not username:
-        return False
+    for payload in pusher_payload_variants(data):
+        gifter = payload.get("gifter") or {}
+        username = normalize_username(
+            payload.get("gifter_username")
+            or payload.get("gifterUsername")
+            or payload.get("gifter_name")
+            or (gifter.get("username") if isinstance(gifter, dict) else None)
+        )
+        if not username:
+            continue
 
-    recipients: list[Any] = []
-    for field in recipient_fields:
-        value = data.get(field)
-        if isinstance(value, list):
-            recipients = value
-            break
+        recipients: list[Any] = []
+        for field in (*recipient_fields, "recipients"):
+            value = payload.get(field)
+            if isinstance(value, list):
+                recipients = value
+                break
 
-    quantity = len(recipients) if recipients else safe_int(
-        data.get("gifted_quantity") or data.get("quantity"), 0
-    )
-    if quantity <= 0:
-        return False
+        quantity = len(recipients) if recipients else safe_int(
+            payload.get("gifted_quantity")
+            or payload.get("giftedQuantity")
+            or payload.get("quantity")
+            or payload.get("count")
+            or payload.get("amount"),
+            0,
+        )
+        if quantity <= 0:
+            continue
 
-    return record_entry(
-        username,
-        "gift_subscription",
-        quantity=quantity,
-        source=source,
-        event_key=pusher_event_key(event_name, data),
-        note="pusher_direct_gift",
-        weight=quantity,
-    )
+        return record_entry(
+            username,
+            "gift_subscription",
+            quantity=quantity,
+            source=source,
+            event_key=pusher_event_key(event_name, data),
+            note="pusher_direct_gift",
+            weight=quantity,
+        )
+    return False
 
 
 def leaderboard_gifter_username(data: dict[str, Any]) -> str | None:
     """Resolve a Pusher leaderboard event's giver when it exposes only an ID."""
-    direct = normalize_username(data.get("gifter_username") or data.get("gifterUsername"))
-    if direct:
-        return direct
+    for payload in pusher_payload_variants(data):
+        direct = normalize_username(payload.get("gifter_username") or payload.get("gifterUsername"))
+        if direct:
+            return direct
 
-    gifter_id = data.get("gifter_id") or data.get("gifterId")
-    if gifter_id is None:
-        return None
-    for field in ("leaderboard", "weekly_leaderboard", "monthly_leaderboard"):
-        entries = data.get(field)
-        if not isinstance(entries, list):
+        gifter_id = payload.get("gifter_id") or payload.get("gifterId")
+        if gifter_id is None:
             continue
-        for entry in entries:
-            if not isinstance(entry, dict):
+        for field in ("leaderboard", "weekly_leaderboard", "monthly_leaderboard"):
+            entries = payload.get(field)
+            if not isinstance(entries, list):
                 continue
-            entry_id = entry.get("user_id") or entry.get("userId") or entry.get("id")
-            if str(entry_id) == str(gifter_id):
-                return normalize_username(entry.get("username"))
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                entry_id = entry.get("user_id") or entry.get("userId") or entry.get("id")
+                if str(entry_id) == str(gifter_id):
+                    return normalize_username(entry.get("username"))
     return None
 
 
 def record_leaderboard_gift_event(event_name: str, data: dict[str, Any]) -> bool:
     """Record the exact current gift reported by a leaderboard update."""
     username = leaderboard_gifter_username(data)
-    quantity = safe_int(data.get("gifted_quantity") or data.get("giftedQuantity"), 0)
+    quantity = 0
+    for payload in pusher_payload_variants(data):
+        quantity = safe_int(payload.get("gifted_quantity") or payload.get("giftedQuantity"), 0)
+        if quantity > 0:
+            break
     if not username or quantity <= 0:
         return False
     return record_entry(
@@ -710,24 +741,22 @@ def consume_text_gift_batch(username: str) -> bool:
 
 def pusher_chat_content(data: dict[str, Any]) -> str:
     """Read a chat/system notice from both known Pusher payload layouts."""
-    value = data.get("content")
-    if not isinstance(value, str):
-        message = data.get("message") or {}
-        value = message.get("content") if isinstance(message, dict) else ""
-    return str(value or "").replace("\u00a0", " ").replace("**", "").strip()
+    for payload in pusher_payload_variants(data):
+        value = payload.get("content")
+        if isinstance(value, str) and value.strip():
+            return value.replace("\u00a0", " ").replace("**", "").strip()
+    return ""
 
 
 def pusher_chat_sender(data: dict[str, Any]) -> str | None:
     """Find the sender when it exists; Kick system notices have no sender."""
-    sender = data.get("sender") or {}
-    if not isinstance(sender, dict):
-        sender = {}
-    if not sender:
-        message = data.get("message") or {}
-        if isinstance(message, dict):
-            nested_sender = message.get("sender") or message.get("user") or {}
-            sender = nested_sender if isinstance(nested_sender, dict) else {}
-    return normalize_username(sender.get("username"))
+    for payload in pusher_payload_variants(data):
+        sender = payload.get("sender") or payload.get("user") or {}
+        if isinstance(sender, dict):
+            username = normalize_username(sender.get("username"))
+            if username:
+                return username
+    return None
 
 
 def record_czech_gift_notice(event_name: str, data: dict[str, Any]) -> bool:
@@ -826,8 +855,17 @@ def extract_from_pusher(event_name: str, data: dict[str, Any]) -> None:
         # Reading only `leaderboard` loses a gift from a new/non-top donor and
         # depends on an in-memory previous total, which is reset on restart.
         record_leaderboard_gift_event(event_name, data)
-        weekly_entries = data.get("weekly_leaderboard")
-        entries = weekly_entries if isinstance(weekly_entries, list) and weekly_entries else data.get("leaderboard", [])
+        leaderboard_payload = next(
+            (
+                payload
+                for payload in pusher_payload_variants(data)
+                if isinstance(payload.get("weekly_leaderboard"), list)
+                or isinstance(payload.get("leaderboard"), list)
+            ),
+            data,
+        )
+        weekly_entries = leaderboard_payload.get("weekly_leaderboard")
+        entries = weekly_entries if isinstance(weekly_entries, list) and weekly_entries else leaderboard_payload.get("leaderboard", [])
         for entry in entries or []:
             if not isinstance(entry, dict):
                 continue
@@ -840,9 +878,12 @@ def extract_from_pusher(event_name: str, data: dict[str, Any]) -> None:
     if "chatmessage" not in event_name.lower():
         return
 
-    sender = data.get("sender") or {}
-    if not isinstance(sender, dict):
-        sender = {}
+    sender: dict[str, Any] = {}
+    for payload in pusher_payload_variants(data):
+        candidate = payload.get("sender") or payload.get("user") or {}
+        if isinstance(candidate, dict):
+            sender = candidate
+            break
     sender_username = pusher_chat_sender(data)
     if sender_username:
         badges = ((sender.get("identity") or {}).get("badges") or [])
