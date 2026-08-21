@@ -558,6 +558,45 @@ def record_pusher_gift(
     )
 
 
+def leaderboard_gifter_username(data: dict[str, Any]) -> str | None:
+    """Resolve a Pusher leaderboard event's giver when it exposes only an ID."""
+    direct = normalize_username(data.get("gifter_username") or data.get("gifterUsername"))
+    if direct:
+        return direct
+
+    gifter_id = data.get("gifter_id") or data.get("gifterId")
+    if gifter_id is None:
+        return None
+    for field in ("leaderboard", "weekly_leaderboard", "monthly_leaderboard"):
+        entries = data.get(field)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            entry_id = entry.get("user_id") or entry.get("userId") or entry.get("id")
+            if str(entry_id) == str(gifter_id):
+                return normalize_username(entry.get("username"))
+    return None
+
+
+def record_leaderboard_gift_event(event_name: str, data: dict[str, Any]) -> bool:
+    """Record the exact current gift reported by a leaderboard update."""
+    username = leaderboard_gifter_username(data)
+    quantity = safe_int(data.get("gifted_quantity") or data.get("giftedQuantity"), 0)
+    if not username or quantity <= 0:
+        return False
+    return record_entry(
+        username,
+        "gift_subscription",
+        quantity=quantity,
+        source="pusher_gift_leaderboard_event",
+        event_key=pusher_event_key(event_name, data),
+        note="pusher_leaderboard_gift",
+        weight=quantity,
+    )
+
+
 def record_gifter_badge(username: str, badge_count: int) -> bool:
     username = username.strip()
     if not username:
@@ -756,12 +795,7 @@ def extract_from_pusher(event_name: str, data: dict[str, Any]) -> None:
         # Kick sends the actual gift that caused this update at the top level.
         # Reading only `leaderboard` loses a gift from a new/non-top donor and
         # depends on an in-memory previous total, which is reset on restart.
-        record_pusher_gift(
-            event_name,
-            data,
-            recipient_fields=("gifted_usernames", "usernames", "giftees"),
-            source="pusher_gift_leaderboard_event",
-        )
+        record_leaderboard_gift_event(event_name, data)
         for entry in data.get("leaderboard", []) or []:
             username = normalize_username(entry.get("username"))
             quantity = safe_int(entry.get("quantity"), 0)

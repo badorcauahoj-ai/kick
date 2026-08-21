@@ -103,6 +103,23 @@ class GiftedSubscriptionEventTests(unittest.TestCase):
             ["theuska"] * 15,
         )
 
+    def test_leaderboard_update_resolves_gifter_name_from_gifter_id(self):
+        tracker.extract_from_pusher(
+            "App\\Events\\GiftsLeaderboardUpdated",
+            {
+                "gifter_id": 345,
+                "gifted_quantity": 5,
+                "leaderboard": [
+                    {"user_id": 345, "username": "theuska", "quantity": 94},
+                ],
+            },
+        )
+
+        rows = tracker.read_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["username"], "theuska")
+        self.assertEqual(rows[0]["quantity"], "5")
+
     def test_czech_community_and_recipient_notices_record_one_gift_only(self):
         tracker.extract_from_pusher(
             "App\\Events\\ChatMessageEvent",
