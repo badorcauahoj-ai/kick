@@ -79,10 +79,20 @@ lock = threading.RLock()
 seen_event_keys: set[str] = set()
 gifter_badge_counts: dict[str, int] = {}
 leaderboard_gift_totals: dict[str, int] = {}
+recent_text_gift_batches: dict[str, tuple[float, int]] = {}
 
 
 RE_GIFT_TO_USER = re.compile(r"gifted a sub(?:scription)? to\s+(\S+)", re.IGNORECASE)
 RE_GIFT_COMMUNITY = re.compile(r"gifted\s+(\d+)\s+subscriptions?\s+to\s+the\s+community", re.IGNORECASE)
+RE_CZ_GIFT_COMMUNITY = re.compile(
+    r"^\s*(?P<gifter>\S+)\s+daroval(?:\(a\)|/a)?\s+(?P<quantity>\d+)\s+"
+    r"předplatn(?:é|i)\s+komunit(?:ě|e)\b",
+    re.IGNORECASE,
+)
+RE_CZ_GIFT_TO_USER = re.compile(
+    r"^\s*(?P<gifter>\S+)\s+daroval(?:\(a\)|/a)?\s+předplatné\s+pro\s+(?P<recipient>\S+)",
+    re.IGNORECASE,
+)
 RE_NEW_SUB = re.compile(r"^(\S+)\s+subscribed(?:\s+for\s+(\d+)\s+months?)?", re.IGNORECASE)
 RE_RESUB = re.compile(r"^(\S+)\s+resubscribed(?:\s+for\s+(\d+)\s+months?)?", re.IGNORECASE)
 
@@ -547,6 +557,33 @@ def record_gifts_leaderboard(username: str, total_quantity: int) -> bool:
     )
 
 
+def start_text_gift_batch(username: str, quantity: int) -> None:
+    """Remember a community-gift message so recipient notices are not double counted."""
+    with lock:
+        recent_text_gift_batches[username.casefold()] = (
+            time.monotonic() + DUPLICATE_WINDOW_SECONDS,
+            max(1, quantity),
+        )
+
+
+def consume_text_gift_batch(username: str) -> bool:
+    """Return true when a recipient notice belongs to a just-recorded community gift."""
+    key = username.casefold()
+    with lock:
+        batch = recent_text_gift_batches.get(key)
+        if not batch:
+            return False
+        expires_at, remaining = batch
+        if time.monotonic() > expires_at or remaining <= 0:
+            recent_text_gift_batches.pop(key, None)
+            return False
+        if remaining == 1:
+            recent_text_gift_batches.pop(key, None)
+        else:
+            recent_text_gift_batches[key] = (expires_at, remaining - 1)
+        return True
+
+
 def extract_from_pusher(event_name: str, data: dict[str, Any]) -> None:
     if event_name == "App\\Events\\SubscriptionEvent":
         username = data.get("username")
@@ -611,17 +648,53 @@ def extract_from_pusher(event_name: str, data: dict[str, Any]) -> None:
 
     sender = data.get("sender") or {}
     sender_username = normalize_username(sender.get("username"))
-    if not sender_username:
+    if sender_username:
+        badges = ((sender.get("identity") or {}).get("badges") or [])
+        for badge in badges:
+            if badge.get("type") == "sub_gifter" and isinstance(badge.get("count"), int):
+                record_gifter_badge(sender_username, badge["count"])
+                break
+
+    content = (data.get("content") or "").replace("\u00a0", " ").replace("**", "").strip()
+    if not content:
         return
 
-    badges = ((sender.get("identity") or {}).get("badges") or [])
-    for badge in badges:
-        if badge.get("type") == "sub_gifter" and isinstance(badge.get("count"), int):
-            record_gifter_badge(sender_username, badge["count"])
-            break
+    # Kick's Czech system notices arrive as a pair: a community summary and
+    # one notice per recipient. Record the giver from the summary, then skip
+    # recipient notices because they describe the same gift batch.
+    match = RE_CZ_GIFT_COMMUNITY.match(content)
+    if match:
+        gifter_username = normalize_username(match.group("gifter"))
+        quantity = safe_int(match.group("quantity"), 1)
+        if gifter_username:
+            start_text_gift_batch(gifter_username, quantity)
+            record_entry(
+                gifter_username,
+                "gift_subscription",
+                quantity=quantity,
+                source="pusher_text_community",
+                event_key=pusher_event_key(event_name, {"gifter": gifter_username, "content": content, "created_at": data.get("created_at")}),
+                note="gift_text_community_cs",
+                weight=quantity,
+            )
+        return
 
-    content = (data.get("content") or "").strip()
-    if not content:
+    match = RE_CZ_GIFT_TO_USER.match(content)
+    if match:
+        gifter_username = normalize_username(match.group("gifter"))
+        if gifter_username and not consume_text_gift_batch(gifter_username):
+            record_entry(
+                gifter_username,
+                "gift_subscription",
+                quantity=1,
+                source="pusher_text_recipient",
+                event_key=pusher_event_key(event_name, {"gifter": gifter_username, "content": content, "created_at": data.get("created_at")}),
+                note="gift_text_to_user_cs",
+                weight=1,
+            )
+        return
+
+    if not sender_username:
         return
 
     if RE_GIFT_TO_USER.search(content):

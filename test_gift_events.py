@@ -43,6 +43,7 @@ class GiftedSubscriptionEventTests(unittest.TestCase):
         tracker.seen_event_keys.clear()
         tracker.gifter_badge_counts.clear()
         tracker.leaderboard_gift_totals.clear()
+        tracker.recent_text_gift_batches.clear()
         tracker.ensure_storage()
 
     def tearDown(self):
@@ -54,6 +55,7 @@ class GiftedSubscriptionEventTests(unittest.TestCase):
             tracker.SEEN_EVENTS_FILE,
         ) = self.old_paths
         tracker.seen_event_keys.clear()
+        tracker.recent_text_gift_batches.clear()
         self.tmpdir.cleanup()
 
     def test_direct_gift_event_adds_the_gifter_and_one_ticket_per_gift(self):
@@ -96,6 +98,29 @@ class GiftedSubscriptionEventTests(unittest.TestCase):
             tracker.NAMES_FILE.read_text(encoding="utf-8").splitlines(),
             ["theuska"] * 15,
         )
+
+    def test_czech_community_and_recipient_notices_record_one_gift_only(self):
+        tracker.extract_from_pusher(
+            "App\\Events\\ChatMessageEvent",
+            {
+                "content": "Dejf7 Daroval(a) 1 předplatné komunitě! Celkem daroval(a) 1 předplatné v kanálu.",
+                "created_at": "2026-08-21T10:00:00Z",
+                "sender": {"username": "system"},
+            },
+        )
+        tracker.extract_from_pusher(
+            "App\\Events\\ChatMessageEvent",
+            {
+                "content": "Dejf7 daroval/a předplatné pro valesh06",
+                "created_at": "2026-08-21T10:00:01Z",
+                "sender": {"username": "system"},
+            },
+        )
+
+        rows = tracker.read_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["username"], "Dejf7")
+        self.assertEqual(rows[0]["quantity"], "1")
 
 
 if __name__ == "__main__":
