@@ -145,6 +145,40 @@ class GiftedSubscriptionEventTests(unittest.TestCase):
             ["theuska"] * 15,
         )
 
+    def test_gift_notice_is_not_mistaken_for_a_normal_subscription(self):
+        tracker.extract_from_pusher(
+            "App\\Events\\SubscriptionEvent",
+            {
+                "username": "jackass",
+                "message": {
+                    "id": "gift-notice-1",
+                    "content": "jackass Daroval(a) 4 předplatná komunitě!",
+                },
+            },
+        )
+
+        rows = tracker.read_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["username"], "jackass")
+        self.assertEqual(rows[0]["type"], "gift_subscription")
+        self.assertEqual(rows[0]["quantity"], "4")
+
+    def test_gift_payload_is_processed_even_with_an_unexpected_event_name(self):
+        tracker.extract_from_pusher(
+            "App\\Events\\SubscriptionEvent",
+            {
+                "gifter_username": "ninja",
+                "gifted_quantity": 3,
+                "message_id": "gift-payload-1",
+            },
+        )
+
+        rows = tracker.read_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["username"], "ninja")
+        self.assertEqual(rows[0]["type"], "gift_subscription")
+        self.assertEqual(rows[0]["quantity"], "3")
+
     def test_reconciliation_adds_only_missing_tickets_and_is_idempotent(self):
         tracker.record_entry("Theushka", "subscription", source="test", event_key="existing")
         os.environ["GIFT_TOTALS_RECONCILE_JSON"] = '{"Theushka": 25, "Dejf7": 1}'

@@ -653,8 +653,6 @@ def pusher_chat_sender(data: dict[str, Any]) -> str | None:
     sender = data.get("sender") or {}
     if not isinstance(sender, dict):
         sender = {}
-    if not isinstance(sender, dict):
-        sender = {}
     if not sender:
         message = data.get("message") or {}
         if isinstance(message, dict):
@@ -663,7 +661,56 @@ def pusher_chat_sender(data: dict[str, Any]) -> str | None:
     return normalize_username(sender.get("username"))
 
 
+def record_czech_gift_notice(event_name: str, data: dict[str, Any]) -> bool:
+    """Record Czech gift-system messages, including ones mislabelled as sub events."""
+    content = pusher_chat_content(data)
+    match = RE_CZ_GIFT_COMMUNITY.match(content)
+    if match:
+        gifter_username = normalize_username(match.group("gifter"))
+        quantity = safe_int(match.group("quantity"), 1)
+        if gifter_username:
+            start_text_gift_batch(gifter_username, quantity)
+            record_entry(
+                gifter_username,
+                "gift_subscription",
+                quantity=quantity,
+                source="pusher_text_community",
+                event_key=pusher_event_key(event_name, data),
+                note="gift_text_community_cs",
+                weight=quantity,
+            )
+        return True
+
+    match = RE_CZ_GIFT_TO_USER.match(content)
+    if match:
+        gifter_username = normalize_username(match.group("gifter"))
+        if gifter_username and not consume_text_gift_batch(gifter_username):
+            record_entry(
+                gifter_username,
+                "gift_subscription",
+                quantity=1,
+                source="pusher_text_recipient",
+                event_key=pusher_event_key(event_name, data),
+                note="gift_text_to_user_cs",
+                weight=1,
+            )
+        return True
+    return False
+
+
 def extract_from_pusher(event_name: str, data: dict[str, Any]) -> None:
+    # Process actual gift data before a generic subscription event. Kick has
+    # occasionally delivered a gift notice under a subscription event name.
+    if record_czech_gift_notice(event_name, data):
+        return
+    if record_pusher_gift(
+        event_name,
+        data,
+        recipient_fields=("gifted_usernames", "usernames", "giftees"),
+        source="pusher_gift_payload",
+    ):
+        return
+
     if event_name == "App\\Events\\SubscriptionEvent":
         username = data.get("username")
         months = safe_int(data.get("months"), 1)
@@ -726,6 +773,8 @@ def extract_from_pusher(event_name: str, data: dict[str, Any]) -> None:
         return
 
     sender = data.get("sender") or {}
+    if not isinstance(sender, dict):
+        sender = {}
     sender_username = pusher_chat_sender(data)
     if sender_username:
         badges = ((sender.get("identity") or {}).get("badges") or [])
@@ -736,41 +785,6 @@ def extract_from_pusher(event_name: str, data: dict[str, Any]) -> None:
 
     content = pusher_chat_content(data)
     if not content:
-        return
-
-    # Kick's Czech system notices arrive as a pair: a community summary and
-    # one notice per recipient. Record the giver from the summary, then skip
-    # recipient notices because they describe the same gift batch.
-    match = RE_CZ_GIFT_COMMUNITY.match(content)
-    if match:
-        gifter_username = normalize_username(match.group("gifter"))
-        quantity = safe_int(match.group("quantity"), 1)
-        if gifter_username:
-            start_text_gift_batch(gifter_username, quantity)
-            record_entry(
-                gifter_username,
-                "gift_subscription",
-                quantity=quantity,
-                source="pusher_text_community",
-                event_key=pusher_event_key(event_name, {"gifter": gifter_username, "content": content, "created_at": data.get("created_at")}),
-                note="gift_text_community_cs",
-                weight=quantity,
-            )
-        return
-
-    match = RE_CZ_GIFT_TO_USER.match(content)
-    if match:
-        gifter_username = normalize_username(match.group("gifter"))
-        if gifter_username and not consume_text_gift_batch(gifter_username):
-            record_entry(
-                gifter_username,
-                "gift_subscription",
-                quantity=1,
-                source="pusher_text_recipient",
-                event_key=pusher_event_key(event_name, {"gifter": gifter_username, "content": content, "created_at": data.get("created_at")}),
-                note="gift_text_to_user_cs",
-                weight=1,
-            )
         return
 
     if not sender_username:
