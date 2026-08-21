@@ -122,6 +122,25 @@ class GiftedSubscriptionEventTests(unittest.TestCase):
         self.assertEqual(rows[0]["username"], "Dejf7")
         self.assertEqual(rows[0]["quantity"], "1")
 
+    def test_czech_plural_community_notice_from_nested_message_adds_all_tickets(self):
+        tracker.extract_from_pusher(
+            "App\\Events\\ChatMessageSentEvent",
+            {
+                "message": {
+                    "content": "theuska Daroval(a) 15 předplatných komunitě! Celkem daroval(a) 89 předplatných v kanálu.",
+                },
+            },
+        )
+
+        rows = tracker.read_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["username"], "theuska")
+        self.assertEqual(rows[0]["quantity"], "15")
+        self.assertEqual(
+            tracker.NAMES_FILE.read_text(encoding="utf-8").splitlines(),
+            ["theuska"] * 15,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

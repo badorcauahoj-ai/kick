@@ -86,7 +86,7 @@ RE_GIFT_TO_USER = re.compile(r"gifted a sub(?:scription)? to\s+(\S+)", re.IGNORE
 RE_GIFT_COMMUNITY = re.compile(r"gifted\s+(\d+)\s+subscriptions?\s+to\s+the\s+community", re.IGNORECASE)
 RE_CZ_GIFT_COMMUNITY = re.compile(
     r"^\s*(?P<gifter>\S+)\s+daroval(?:\(a\)|/a)?\s+(?P<quantity>\d+)\s+"
-    r"předplatn(?:é|i)\s+komunit(?:ě|e)\b",
+    r"předplatn(?:é|í|á|ých)\s+komunit(?:ě|e)\b",
     re.IGNORECASE,
 )
 RE_CZ_GIFT_TO_USER = re.compile(
@@ -584,6 +584,30 @@ def consume_text_gift_batch(username: str) -> bool:
         return True
 
 
+def pusher_chat_content(data: dict[str, Any]) -> str:
+    """Read a chat/system notice from both known Pusher payload layouts."""
+    value = data.get("content")
+    if not isinstance(value, str):
+        message = data.get("message") or {}
+        value = message.get("content") if isinstance(message, dict) else ""
+    return str(value or "").replace("\u00a0", " ").replace("**", "").strip()
+
+
+def pusher_chat_sender(data: dict[str, Any]) -> str | None:
+    """Find the sender when it exists; Kick system notices have no sender."""
+    sender = data.get("sender") or {}
+    if not isinstance(sender, dict):
+        sender = {}
+    if not isinstance(sender, dict):
+        sender = {}
+    if not sender:
+        message = data.get("message") or {}
+        if isinstance(message, dict):
+            nested_sender = message.get("sender") or message.get("user") or {}
+            sender = nested_sender if isinstance(nested_sender, dict) else {}
+    return normalize_username(sender.get("username"))
+
+
 def extract_from_pusher(event_name: str, data: dict[str, Any]) -> None:
     if event_name == "App\\Events\\SubscriptionEvent":
         username = data.get("username")
@@ -647,7 +671,7 @@ def extract_from_pusher(event_name: str, data: dict[str, Any]) -> None:
         return
 
     sender = data.get("sender") or {}
-    sender_username = normalize_username(sender.get("username"))
+    sender_username = pusher_chat_sender(data)
     if sender_username:
         badges = ((sender.get("identity") or {}).get("badges") or [])
         for badge in badges:
@@ -655,7 +679,7 @@ def extract_from_pusher(event_name: str, data: dict[str, Any]) -> None:
                 record_gifter_badge(sender_username, badge["count"])
                 break
 
-    content = (data.get("content") or "").replace("\u00a0", " ").replace("**", "").strip()
+    content = pusher_chat_content(data)
     if not content:
         return
 
