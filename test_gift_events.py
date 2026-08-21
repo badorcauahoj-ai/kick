@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 import sys
 import types
+import os
 
 
 # The application dependencies are installed in Railway.  The bundled local
@@ -44,6 +45,7 @@ class GiftedSubscriptionEventTests(unittest.TestCase):
         tracker.gifter_badge_counts.clear()
         tracker.leaderboard_gift_totals.clear()
         tracker.recent_text_gift_batches.clear()
+        self.old_reconcile_totals = os.environ.pop("GIFT_TOTALS_RECONCILE_JSON", None)
         tracker.ensure_storage()
 
     def tearDown(self):
@@ -56,6 +58,8 @@ class GiftedSubscriptionEventTests(unittest.TestCase):
         ) = self.old_paths
         tracker.seen_event_keys.clear()
         tracker.recent_text_gift_batches.clear()
+        if self.old_reconcile_totals is not None:
+            os.environ["GIFT_TOTALS_RECONCILE_JSON"] = self.old_reconcile_totals
         self.tmpdir.cleanup()
 
     def test_direct_gift_event_adds_the_gifter_and_one_ticket_per_gift(self):
@@ -140,6 +144,16 @@ class GiftedSubscriptionEventTests(unittest.TestCase):
             tracker.NAMES_FILE.read_text(encoding="utf-8").splitlines(),
             ["theuska"] * 15,
         )
+
+    def test_reconciliation_adds_only_missing_tickets_and_is_idempotent(self):
+        tracker.record_entry("Theushka", "subscription", source="test", event_key="existing")
+        os.environ["GIFT_TOTALS_RECONCILE_JSON"] = '{"Theushka": 25, "Dejf7": 1}'
+
+        self.assertEqual(tracker.reconcile_wheel_totals_from_env(), 25)
+        self.assertEqual(tracker.reconcile_wheel_totals_from_env(), 0)
+        tickets = tracker.NAMES_FILE.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(sum(name.casefold() == "theushka" for name in tickets), 25)
+        self.assertEqual(sum(name.casefold() == "dejf7" for name in tickets), 1)
 
 
 if __name__ == "__main__":

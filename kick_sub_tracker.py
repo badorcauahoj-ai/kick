@@ -274,6 +274,19 @@ def rebuild_wheel_tickets_unlocked() -> int:
     return len(tickets)
 
 
+def wheel_ticket_counts_unlocked() -> dict[str, int]:
+    """Count currently eligible tickets, case-insensitively, from the wheel cache."""
+    counts: dict[str, int] = {}
+    if not NAMES_FILE.exists():
+        return counts
+    for value in NAMES_FILE.read_text(encoding="utf-8").splitlines():
+        username = normalize_username(value)
+        if username:
+            key = username.casefold()
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
 def record_entry(
     username: Any,
     entry_type: str,
@@ -314,6 +327,48 @@ def record_entry(
 
     print(f"[+] {entry_type}: {username} x{quantity} ({source})")
     return True
+
+
+def reconcile_wheel_totals_from_env() -> int:
+    """Add only missing tickets from a one-time operator-supplied total list."""
+    raw_totals = os.environ.get("GIFT_TOTALS_RECONCILE_JSON", "").strip()
+    if not raw_totals:
+        return 0
+    try:
+        totals = json.loads(raw_totals)
+    except json.JSONDecodeError:
+        print("[!] GIFT_TOTALS_RECONCILE_JSON is not valid JSON; reconciliation skipped.")
+        return 0
+    if not isinstance(totals, dict):
+        print("[!] GIFT_TOTALS_RECONCILE_JSON must be a JSON object; reconciliation skipped.")
+        return 0
+
+    added = 0
+    with lock:
+        current = wheel_ticket_counts_unlocked()
+    for raw_username, raw_total in totals.items():
+        username = normalize_username(raw_username)
+        total = safe_int(raw_total, 0)
+        if not username or total <= 0:
+            continue
+        missing = total - current.get(username.casefold(), 0)
+        if missing <= 0:
+            continue
+        target_key = fingerprint("manual_total", {"username": username.casefold(), "target": total})
+        if record_entry(
+            username,
+            "gift_subscription",
+            quantity=missing,
+            source="manual_total_reconciliation",
+            event_key=target_key,
+            note=f"target_total={total}",
+            weight=missing,
+        ):
+            added += missing
+            current[username.casefold()] = total
+    if added:
+        print(f"[i] Reconciled {added} missing wheel tickets from configured totals.")
+    return added
 
 
 def remove_one_ticket(username: str) -> bool:
@@ -1304,6 +1359,7 @@ canvas {{ width:100%; height:auto; border-radius:50%; border:1px solid var(--bor
 def main() -> None:
     slug = os.environ.get("KICK_CHANNEL") or (sys.argv[1] if len(sys.argv) > 1 else "tyblaho69")
     ensure_storage()
+    reconcile_wheel_totals_from_env()
     start_file_server(slug)
     maybe_auto_subscribe_official_events()
 
