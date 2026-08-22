@@ -1272,7 +1272,6 @@ document.querySelectorAll('.del').forEach((btn) => {{
   <div class="hub"></div>
 </div>
 <button id="spin" class="spin">Roztocit kolo</button>
-<div id="meta" class="meta-line"></div>
 <div id="result" class="result">
   <div class="label">Vitez</div>
   <div id="winner" class="winner"></div>
@@ -1291,7 +1290,6 @@ const size = canvas.width;
 const center = size / 2;
 const radius = center - 4;
 let rotation = 0;
-document.getElementById('meta').textContent = names.length + ' listku na kole';
 
 function draw() {{
   const n = names.length;
@@ -1397,7 +1395,6 @@ canvas {{ width:100%; height:auto; border-radius:50%; border:1px solid var(--bor
 .hub {{ position:absolute; left:50%; top:50%; transform:translate(-50%, -50%); width:16px; height:16px; border-radius:50%; background:var(--white); }}
 .spin {{ background:var(--white); color:#080808; border:0; border-radius:9px; padding:12px 28px; font-weight:700; cursor:pointer; }}
 .spin:disabled {{ opacity:.55; cursor:not-allowed; }}
-.meta-line {{ margin-top:13px; color:var(--muted); font:12px ui-monospace, SFMono-Regular, Consolas, monospace; }}
 .result {{ display:none; margin-top:24px; text-align:center; border:1px solid var(--border); background:var(--panel); border-radius:12px; padding:20px 28px; }}
 .label {{ color:var(--muted); text-transform:uppercase; letter-spacing:.07em; font-size:11px; margin-bottom:8px; }}
 .winner {{ color:var(--green); font:700 24px ui-monospace, SFMono-Regular, Consolas, monospace; margin-bottom:16px; }}
