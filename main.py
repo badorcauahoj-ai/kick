@@ -11,18 +11,23 @@ relied on:
 - Local CSV/JSON files. Nothing written to disk survives past the request.
 
 Instead this build is webhook-only (POST /kick/webhook) and stores
-everything in Upstash Redis (the "Redis" storage product in Vercel's
-Storage tab), reached over its REST API so no extra native dependency is
-needed. Kick's official webhook payload is documented and stable, so most
-of the heuristic chat-parsing this project used to carry for the Pusher
-fallback simply doesn't apply here anymore.
+everything in Redis (the "Redis" storage product in Vercel's Storage tab).
+Vercel's marketplace offers this backed by different providers depending on
+what the operator picks (Upstash exposes an HTTPS REST API; Redis Cloud and
+others hand out a plain `redis://`/`rediss://` connection string instead),
+and the operator can also choose a custom env var prefix when connecting it
+- so this detects both connection styles by scanning env var *values*
+rather than requiring one fixed variable name. Kick's official webhook
+payload is documented and stable, so most of the heuristic chat-parsing
+this project used to carry for the Pusher fallback simply doesn't apply
+here anymore.
 
 Required environment variables:
-    A Redis REST URL/token pair, injected automatically once a Redis store
-    is connected to the Vercel project (Storage tab -> Create Database ->
-    Redis). The operator can pick a custom env var prefix when connecting
-    it, so this checks several common conventions - see
-    _REDIS_ENV_CANDIDATES below - rather than requiring one exact pair.
+    A Redis connection, injected automatically once a Redis store is
+    connected to the Vercel project (Storage tab -> Create Database ->
+    Redis) - either a `redis://`/`rediss://` connection string, or an
+    HTTPS REST URL paired with a bearer token (see _resolve_redis_connection
+    below for exactly how these are detected).
     KICK_CHANNEL, WEBHOOK_TOKEN, ADMIN_TOKEN, MAX_TICKETS_PER_USER
         Same meaning as in kick_sub_tracker.py - see README.md.
 """
@@ -39,6 +44,11 @@ from typing import Any
 import requests
 from flask import Flask, abort, jsonify, request, Response
 
+try:
+    import redis as redis_lib
+except ImportError:
+    redis_lib = None
+
 app = Flask(__name__)
 
 KICK_CHANNEL = os.environ.get("KICK_CHANNEL", "tyblaho69")
@@ -51,30 +61,38 @@ try:
 except ValueError:
     MAX_WHEEL_TICKETS_PER_USER = 3
 
-# Vercel's Redis marketplace integration lets the operator pick a custom env
-# var prefix when connecting it to the project, so the exact names aren't
-# fixed. Try the common conventions in order rather than requiring one
-# specific pair.
-_REDIS_ENV_CANDIDATES = (
+# Upstash-style REST API: separate HTTPS URL + bearer token. Vercel lets the
+# operator pick a custom env var prefix when connecting the integration, so
+# the exact names aren't fixed - try the common conventions.
+_REST_ENV_CANDIDATES = (
     ("UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN"),
     ("KV_REST_API_URL", "KV_REST_API_TOKEN"),
     ("STORAGE_URL", "STORAGE_TOKEN"),
     ("STORAGE_REST_API_URL", "STORAGE_REST_API_TOKEN"),
     ("REDIS_REST_API_URL", "REDIS_REST_API_TOKEN"),
-    ("REDIS_URL", "REDIS_TOKEN"),
 )
 
 
-def _resolve_redis_env() -> tuple[str, str]:
-    for url_key, token_key in _REDIS_ENV_CANDIDATES:
+def _resolve_redis_connection() -> tuple[str, str, str]:
+    """Return (mode, url, token). mode is "tcp", "rest", or "" if unconfigured.
+
+    A standard `redis://`/`rediss://` connection string (Redis Cloud and
+    most other providers) is found by scanning env var *values*, since the
+    variable name depends on whatever prefix the operator chose when
+    connecting the integration - there is no fixed name to look for.
+    """
+    for value in os.environ.values():
+        if value.startswith("redis://") or value.startswith("rediss://"):
+            return "tcp", value, ""
+    for url_key, token_key in _REST_ENV_CANDIDATES:
         url, token = os.environ.get(url_key), os.environ.get(token_key)
         if url and token:
-            return url, token
-    return "", ""
+            return "rest", url.rstrip("/"), token
+    return "", "", ""
 
 
-UPSTASH_URL, UPSTASH_TOKEN = _resolve_redis_env()
-UPSTASH_URL = UPSTASH_URL.rstrip("/")
+REDIS_MODE, REDIS_URL, REDIS_TOKEN = _resolve_redis_connection()
+_redis_client = None
 
 OFFICIAL_SUB_EVENTS = {
     "channel.subscription.new",
@@ -131,26 +149,52 @@ class RedisNotConfigured(RuntimeError):
     pass
 
 
+def _get_redis_client():
+    global _redis_client
+    if _redis_client is None:
+        if redis_lib is None:
+            raise RedisNotConfigured("The 'redis' package is not installed (check requirements.txt).")
+        _redis_client = redis_lib.Redis.from_url(REDIS_URL, decode_responses=True)
+    return _redis_client
+
+
 def redis_cmd(*args: Any) -> Any:
-    """Run one Redis command against Upstash's REST API."""
-    if not UPSTASH_URL or not UPSTASH_TOKEN:
-        tried = ", ".join(f"{u}/{t}" for u, t in _REDIS_ENV_CANDIDATES)
-        raise RedisNotConfigured(
-            "No Redis REST URL/token pair found in the environment. "
-            "Connect a Redis store to this Vercel project (Storage tab -> "
-            f"Create Database) and redeploy. Tried: {tried}"
+    """Run one Redis command, over a TCP connection or Upstash's REST API.
+
+    Both branches are made to return the same shapes the rest of this file
+    expects (notably HGETALL as a flat [k, v, k, v, ...] list, matching the
+    raw REST API's response) so nothing else needs to know which mode is
+    active.
+    """
+    if REDIS_MODE == "tcp":
+        result = _get_redis_client().execute_command(*args)
+        if str(args[0]).upper() == "HGETALL" and isinstance(result, dict):
+            flat: list[Any] = []
+            for k, v in result.items():
+                flat.extend([k, v])
+            return flat
+        return result
+
+    if REDIS_MODE == "rest":
+        resp = requests.post(
+            REDIS_URL,
+            json=[str(a) for a in args],
+            headers={"Authorization": f"Bearer {REDIS_TOKEN}"},
+            timeout=10,
         )
-    resp = requests.post(
-        UPSTASH_URL,
-        json=[str(a) for a in args],
-        headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
-        timeout=10,
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("error"):
+            raise RuntimeError(f"Redis error for {args[:1]}: {data['error']}")
+        return data.get("result")
+
+    tried_tcp = "a redis:// or rediss:// connection string (found by value, any variable name)"
+    tried_rest = ", ".join(f"{u}/{t}" for u, t in _REST_ENV_CANDIDATES)
+    raise RedisNotConfigured(
+        "No Redis connection found in the environment. Connect a Redis "
+        f"store to this Vercel project (Storage tab -> Create Database) and "
+        f"redeploy. Tried: {tried_tcp}; or a REST URL/token pair: {tried_rest}"
     )
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("error"):
-        raise RuntimeError(f"Redis error for {args[:1]}: {data['error']}")
-    return data.get("result")
 
 
 def add_wheel_tickets(username: str, weight: int) -> int:
