@@ -46,21 +46,40 @@ meaning as below.
 
 ### 3. Kick webhook
 
-Use this webhook URL, replacing the token with your `WEBHOOK_TOKEN`:
+The app's webhook URL is:
 
 ```txt
 https://<your-vercel-project>.vercel.app/kick/webhook?token=YOUR_WEBHOOK_TOKEN
 ```
 
-Subscribe to these Kick events (Kick developer dashboard or the
-events-subscriptions API - **this step happens on Kick's side and the app
-cannot verify it for you**):
+Kick needs to be told to actually call it, by subscribing to these events:
 
 ```txt
 channel.subscription.new
 channel.subscription.renewal
 channel.subscription.gifts
 ```
+
+This subscription step happens entirely on Kick's side and requires an
+OAuth 2.0 Authorization Code + PKCE flow (Kick has no simpler option, even
+for a channel owner subscribing their own events). The app automates that
+flow so you only have to click a link and log into Kick once:
+
+1. Go to Kick's Developer dashboard, create an app, and set its **Redirect
+   URL** to exactly:
+   ```txt
+   https://<your-vercel-project>.vercel.app/kick/oauth/callback
+   ```
+2. Add two more environment variables in Vercel from that app's page:
+   ```txt
+   KICK_CLIENT_ID=...
+   KICK_CLIENT_SECRET=...
+   ```
+   and redeploy.
+3. Open `https://<your-vercel-project>.vercel.app/kick/oauth/start?admin=YOUR_ADMIN_TOKEN`
+   in a browser (or click "Pripojit Kick webhook" on `/` while logged in as
+   admin), log into Kick, and approve it. The page that comes back confirms
+   the subscription (or shows exactly what Kick rejected, if anything).
 
 Gifts never showing up at all almost always means this step was skipped, or
 the URL/token doesn't match what's subscribed. After a real gift, check

@@ -13,6 +13,7 @@ if "flask" not in sys.modules:
     flask_stub.Flask = lambda *a, **k: types.SimpleNamespace(route=lambda *a, **k: (lambda f: f))
     flask_stub.abort = lambda *a, **k: None
     flask_stub.jsonify = lambda *a, **k: {"jsonify": (a, k)}
+    flask_stub.redirect = lambda *a, **k: None
     flask_stub.request = object()
     flask_stub.Response = lambda *a, **k: None
     sys.modules["flask"] = flask_stub
@@ -107,14 +108,14 @@ class VercelTrackerTests(unittest.TestCase):
         self.fake = FakeRedis()
         self.old_redis_cmd = tracker.redis_cmd
         tracker.redis_cmd = self.fake.cmd
-        self.old_url, self.old_token = tracker.UPSTASH_URL, tracker.UPSTASH_TOKEN
-        tracker.UPSTASH_URL, tracker.UPSTASH_TOKEN = "fake", "fake"
+        self.old_mode = tracker.REDIS_MODE
+        tracker.REDIS_MODE = "rest"  # redis_cmd is fully replaced above; any truthy mode satisfies callers
         self.old_count_anon = tracker.COUNT_ANONYMOUS_GIFTS
         tracker.COUNT_ANONYMOUS_GIFTS = False
 
     def tearDown(self):
         tracker.redis_cmd = self.old_redis_cmd
-        tracker.UPSTASH_URL, tracker.UPSTASH_TOKEN = self.old_url, self.old_token
+        tracker.REDIS_MODE = self.old_mode
         tracker.COUNT_ANONYMOUS_GIFTS = self.old_count_anon
 
     def test_duplicate_event_key_is_not_recorded_twice(self):

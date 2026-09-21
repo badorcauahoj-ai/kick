@@ -34,15 +34,18 @@ Required environment variables:
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import html
 import json
 import os
+import secrets
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlencode
 
 import requests
-from flask import Flask, abort, jsonify, request, Response
+from flask import Flask, abort, jsonify, redirect, request, Response
 
 try:
     import redis as redis_lib
@@ -93,6 +96,17 @@ def _resolve_redis_connection() -> tuple[str, str, str]:
 
 REDIS_MODE, REDIS_URL, REDIS_TOKEN = _resolve_redis_connection()
 _redis_client = None
+
+# Kick requires a full OAuth 2.0 Authorization Code + PKCE flow to get a
+# token that can subscribe to webhook events - there is no shortcut for a
+# single-channel owner. /kick/oauth/start and /kick/oauth/callback below
+# do that flow so the operator only has to click a link and log into Kick
+# once, instead of hand-rolling PKCE and token exchange over curl.
+KICK_CLIENT_ID = os.environ.get("KICK_CLIENT_ID")
+KICK_CLIENT_SECRET = os.environ.get("KICK_CLIENT_SECRET")
+KICK_OAUTH_AUTHORIZE_URL = "https://id.kick.com/oauth/authorize"
+KICK_OAUTH_TOKEN_URL = "https://id.kick.com/oauth/token"
+KICK_EVENTS_SUBSCRIPTIONS_URL = "https://api.kick.com/public/v1/events/subscriptions"
 
 OFFICIAL_SUB_EVENTS = {
     "channel.subscription.new",
@@ -423,6 +437,129 @@ def admin_qs() -> str:
     return ""
 
 
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _pkce_pair() -> tuple[str, str]:
+    verifier = _b64url(secrets.token_bytes(40))
+    challenge = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
+    return verifier, challenge
+
+
+def _oauth_redirect_uri() -> str:
+    base = os.environ.get("PUBLIC_BASE_URL") or request.host_url
+    return base.rstrip("/") + "/kick/oauth/callback"
+
+
+@app.route("/kick/oauth/start")
+def kick_oauth_start() -> Any:
+    """Kick off the OAuth dance needed to subscribe to webhook events.
+
+    Kick requires a full Authorization Code + PKCE flow even for a channel
+    owner subscribing their own events - there is no simpler token option.
+    This generates the PKCE pair, stashes the verifier in Redis keyed by a
+    one-time state value, and sends the browser to Kick's login/consent
+    screen. /kick/oauth/callback below finishes the job once Kick redirects
+    back.
+    """
+    if not admin_allowed():
+        return jsonify(ok=False, error="forbidden"), 403
+    if not KICK_CLIENT_ID:
+        return jsonify(ok=False, error="KICK_CLIENT_ID is not set"), 400
+
+    verifier, challenge = _pkce_pair()
+    state = secrets.token_urlsafe(24)
+    redis_cmd("SET", f"kick_oauth_verifier:{state}", verifier, "EX", "600")
+
+    params = {
+        "client_id": KICK_CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": _oauth_redirect_uri(),
+        "scope": "events:subscribe",
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "state": state,
+    }
+    return redirect(f"{KICK_OAUTH_AUTHORIZE_URL}?{urlencode(params)}")
+
+
+def _oauth_result_page(ok: bool, message: str) -> str:
+    color = "#55c878" if ok else "#ff695f"
+    title = "Hotovo" if ok else "Chyba"
+    return f"""<!doctype html>
+<html lang="cs"><head><meta charset="utf-8">
+<title>Kick OAuth - {html.escape(title)}</title>
+<style>
+body {{ margin:0; min-height:100vh; background:#050505; color:#efefef; display:flex; align-items:center; justify-content:center;
+  font-family:Inter, ui-sans-serif, system-ui, sans-serif; padding:20px; }}
+main {{ max-width:520px; text-align:center; }}
+h1 {{ color:{color}; }}
+pre {{ text-align:left; white-space:pre-wrap; word-break:break-word; background:#0b0b0b; border:1px solid rgba(255,255,255,.1);
+  border-radius:8px; padding:16px; font-size:13px; }}
+a {{ color:#aaa; }}
+</style></head>
+<body><main><h1>{html.escape(title)}</h1><pre>{html.escape(message)}</pre>
+<p><a href="/">Zpet na prehled</a></p></main></body></html>"""
+
+
+@app.route("/kick/oauth/callback")
+def kick_oauth_callback() -> Any:
+    error = request.args.get("error")
+    if error:
+        return _oauth_result_page(False, f"Kick vratil chybu: {error}"), 400
+
+    code = request.args.get("code")
+    state = request.args.get("state")
+    if not code or not state:
+        return _oauth_result_page(False, "Chybi code nebo state v odpovedi od Kicku."), 400
+
+    verifier = redis_cmd("GET", f"kick_oauth_verifier:{state}")
+    if not verifier:
+        return _oauth_result_page(
+            False, "Neznamy nebo vyprsely state. Zacni znovu na /kick/oauth/start."
+        ), 400
+    redis_cmd("DEL", f"kick_oauth_verifier:{state}")
+
+    token_resp = requests.post(
+        KICK_OAUTH_TOKEN_URL,
+        data={
+            "grant_type": "authorization_code",
+            "client_id": KICK_CLIENT_ID,
+            "client_secret": KICK_CLIENT_SECRET,
+            "code": code,
+            "redirect_uri": _oauth_redirect_uri(),
+            "code_verifier": verifier,
+        },
+        timeout=15,
+    )
+    if token_resp.status_code >= 400:
+        return _oauth_result_page(
+            False, f"Vymena tokenu selhala ({token_resp.status_code}):\n{token_resp.text}"
+        ), 400
+
+    access_token = (token_resp.json() or {}).get("access_token")
+    if not access_token:
+        return _oauth_result_page(False, f"Odpoved neobsahuje access_token:\n{token_resp.text}"), 400
+
+    sub_resp = requests.post(
+        KICK_EVENTS_SUBSCRIPTIONS_URL,
+        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+        json={"events": [{"name": name, "version": 1} for name in sorted(OFFICIAL_SUB_EVENTS)]},
+        timeout=15,
+    )
+    if sub_resp.status_code >= 400:
+        return _oauth_result_page(
+            False, f"Prihlaseni k eventum selhalo ({sub_resp.status_code}):\n{sub_resp.text}"
+        ), 400
+
+    return _oauth_result_page(
+        True,
+        "Kick ted posila webhooky pro channel.subscription.new/renewal/gifts na tento web.\n\n"
+        + sub_resp.text,
+    )
+
+
 @app.route("/health")
 def health() -> Any:
     try:
@@ -664,6 +801,7 @@ footer {{ color:var(--muted); display:flex; justify-content:space-between; font-
   <nav class="actions">
     <a class="btn primary" href="/subscription_names.txt{qs}">Stahnout jmena (.txt)</a>
     <a class="btn" href="/subscribers.csv{qs}">Export detailu (.csv)</a>
+    {f'<a class="btn" href="/kick/oauth/start{qs}">Pripojit Kick webhook</a>' if qs else ''}
   </nav>
   {diag_html}
   <section class="panel">
