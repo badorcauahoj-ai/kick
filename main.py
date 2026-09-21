@@ -18,9 +18,11 @@ of the heuristic chat-parsing this project used to carry for the Pusher
 fallback simply doesn't apply here anymore.
 
 Required environment variables:
-    UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN
-        Injected automatically once a Redis store is connected to the
-        Vercel project (Storage tab -> Create Database -> Redis).
+    A Redis REST URL/token pair, injected automatically once a Redis store
+    is connected to the Vercel project (Storage tab -> Create Database ->
+    Redis). The operator can pick a custom env var prefix when connecting
+    it, so this checks several common conventions - see
+    _REDIS_ENV_CANDIDATES below - rather than requiring one exact pair.
     KICK_CHANNEL, WEBHOOK_TOKEN, ADMIN_TOKEN, MAX_TICKETS_PER_USER
         Same meaning as in kick_sub_tracker.py - see README.md.
 """
@@ -49,8 +51,30 @@ try:
 except ValueError:
     MAX_WHEEL_TICKETS_PER_USER = 3
 
-UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").rstrip("/")
-UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
+# Vercel's Redis marketplace integration lets the operator pick a custom env
+# var prefix when connecting it to the project, so the exact names aren't
+# fixed. Try the common conventions in order rather than requiring one
+# specific pair.
+_REDIS_ENV_CANDIDATES = (
+    ("UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN"),
+    ("KV_REST_API_URL", "KV_REST_API_TOKEN"),
+    ("STORAGE_URL", "STORAGE_TOKEN"),
+    ("STORAGE_REST_API_URL", "STORAGE_REST_API_TOKEN"),
+    ("REDIS_REST_API_URL", "REDIS_REST_API_TOKEN"),
+    ("REDIS_URL", "REDIS_TOKEN"),
+)
+
+
+def _resolve_redis_env() -> tuple[str, str]:
+    for url_key, token_key in _REDIS_ENV_CANDIDATES:
+        url, token = os.environ.get(url_key), os.environ.get(token_key)
+        if url and token:
+            return url, token
+    return "", ""
+
+
+UPSTASH_URL, UPSTASH_TOKEN = _resolve_redis_env()
+UPSTASH_URL = UPSTASH_URL.rstrip("/")
 
 OFFICIAL_SUB_EVENTS = {
     "channel.subscription.new",
@@ -110,10 +134,11 @@ class RedisNotConfigured(RuntimeError):
 def redis_cmd(*args: Any) -> Any:
     """Run one Redis command against Upstash's REST API."""
     if not UPSTASH_URL or not UPSTASH_TOKEN:
+        tried = ", ".join(f"{u}/{t}" for u, t in _REDIS_ENV_CANDIDATES)
         raise RedisNotConfigured(
-            "UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN are not set. "
+            "No Redis REST URL/token pair found in the environment. "
             "Connect a Redis store to this Vercel project (Storage tab -> "
-            "Create Database) and redeploy."
+            f"Create Database) and redeploy. Tried: {tried}"
         )
     resp = requests.post(
         UPSTASH_URL,
