@@ -610,8 +610,19 @@ def admin_reconcile() -> Any:
         return jsonify(ok=False, error="GIFT_TOTALS_RECONCILE_JSON is not set"), 400
     try:
         totals = json.loads(raw_totals)
-    except json.JSONDecodeError:
-        return jsonify(ok=False, error="GIFT_TOTALS_RECONCILE_JSON is not valid JSON"), 400
+    except json.JSONDecodeError as exc:
+        # A previous edit here that "should" have been valid JSON kept failing
+        # the same way twice in a row - almost always means Vercel is still
+        # serving an older deployment that predates the fix (env var changes
+        # need a redeploy to take effect). Echo back exactly what this
+        # running instance sees instead of guessing blind a third time.
+        return jsonify(
+            ok=False,
+            error="GIFT_TOTALS_RECONCILE_JSON is not valid JSON",
+            detail=str(exc),
+            raw_length=len(raw_totals),
+            raw_preview=raw_totals[:300],
+        ), 400
     if not isinstance(totals, dict):
         return jsonify(ok=False, error="GIFT_TOTALS_RECONCILE_JSON must be a JSON object"), 400
     added = reconcile_wheel_totals(totals)
